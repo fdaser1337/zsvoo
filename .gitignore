@@ -1,0 +1,48 @@
+# Binary executables
+zsvo
+pkg-manager
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cache directories
+.cache/
+tmp/
+temp/
+
+# Test coverage
+coverage.txt
+*.coverprofile
+
+# Dependency directories
+vendor/
+node_modules/
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.production
+
+# Backup files
+*.bak
+*.backup
+*.orig
