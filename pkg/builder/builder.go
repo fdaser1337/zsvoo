@@ -8,8 +8,9 @@ import (
 	"runtime"
 	"strings"
 
-	"zsvo/pkg/recipe"
 	"zsvo/pkg/fetcher"
+	"zsvo/pkg/packager"
+	"zsvo/pkg/recipe"
 )
 
 // Builder handles building packages from recipes
@@ -26,6 +27,10 @@ func NewBuilder(workDir string) *Builder {
 
 // Build builds a package from a recipe
 func (b *Builder) Build(recipe *recipe.Recipe) error {
+	if recipe == nil {
+		return fmt.Errorf("recipe cannot be nil")
+	}
+
 	// Create working directories
 	sourceDir := recipe.GetSourceDir(b.workDir)
 	stagingDir := recipe.GetStagingDir(b.workDir)
@@ -51,8 +56,14 @@ func (b *Builder) Build(recipe *recipe.Recipe) error {
 	}
 
 	// Package files
-	if err := b.packageFiles(recipe, sourceDir, stagingDir, packageDir); err != nil {
+	if err := b.packageFiles(recipe, sourceDir, stagingDir); err != nil {
 		return fmt.Errorf("failed to package files: %w", err)
+	}
+
+	// Create package archive
+	p := packager.NewPackager(b.workDir)
+	if err := p.Package(recipe); err != nil {
+		return fmt.Errorf("failed to create package archive: %w", err)
 	}
 
 	return nil
@@ -77,11 +88,25 @@ func (b *Builder) prepareDirectories(sourceDir, stagingDir, packageDir string) e
 
 // downloadAndExtract downloads and extracts source
 func (b *Builder) downloadAndExtract(recipe *recipe.Recipe) error {
+	sourceDir := recipe.GetSourceDir(b.workDir)
+	if err := os.RemoveAll(sourceDir); err != nil {
+		return fmt.Errorf("failed to clean source directory: %w", err)
+	}
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		return fmt.Errorf("failed to recreate source directory: %w", err)
+	}
+
 	f := fetcher.NewFetcher(filepath.Join(b.workDir, "cache"))
+
+	sourceURL := recipe.Source.URL
+	if recipe.Source.DebianDSC != "" {
+		sourceURL = recipe.Source.DebianDSC
+	}
+
 	return f.DownloadAndExtract(
-		recipe.Source.URL,
+		sourceURL,
 		recipe.Source.Sha256,
-		recipe.GetSourceDir(b.workDir),
+		sourceDir,
 	)
 }
 
@@ -91,8 +116,20 @@ func (b *Builder) applyPatches(recipe *recipe.Recipe, sourceDir string) error {
 		return nil
 	}
 
+	patches := make([]string, 0, len(recipe.Source.Patches))
+	for _, patchPath := range recipe.Source.Patches {
+		if patchPath == "" {
+			return fmt.Errorf("patch path cannot be empty")
+		}
+
+		if !filepath.IsAbs(patchPath) && recipe.Dir != "" {
+			patchPath = filepath.Join(recipe.Dir, patchPath)
+		}
+		patches = append(patches, patchPath)
+	}
+
 	f := fetcher.NewFetcher(filepath.Join(b.workDir, "cache"))
-	return f.ApplyPatches(sourceDir, recipe.Source.Patches)
+	return f.ApplyPatches(sourceDir, patches)
 }
 
 // executeBuild executes build commands
@@ -104,13 +141,13 @@ func (b *Builder) executeBuild(recipe *recipe.Recipe, sourceDir, stagingDir stri
 	}
 
 	// Set up environment
-	env := b.buildEnvironment(recipe, stagingDir)
+	env := b.buildEnvironment(stagingDir)
 
 	// Execute build commands
-	for i, cmd := range recipe.Build.Commands {
+	for i, cmd := range recipe.Build {
 		// Substitute variables in command
-		cmd = b.substituteVariables(cmd, recipe, sourceDir, stagingDir)
-		
+		cmd = b.substituteVariables(cmd, sourceDir, stagingDir)
+
 		if err := b.executeCommand(srcPath, cmd, env); err != nil {
 			return fmt.Errorf("build command %d failed: %w", i+1, err)
 		}
@@ -144,18 +181,13 @@ func (b *Builder) findSourceDirectory(sourceDir string) (string, error) {
 }
 
 // buildEnvironment builds the environment for build commands
-func (b *Builder) buildEnvironment(recipe *recipe.Recipe, stagingDir string) []string {
+func (b *Builder) buildEnvironment(stagingDir string) []string {
 	env := os.Environ()
 
 	// Add standard build environment variables
 	env = append(env, fmt.Sprintf("DESTDIR=%s", stagingDir))
 	env = append(env, fmt.Sprintf("PREFIX=/usr"))
 	env = append(env, fmt.Sprintf("PKGDIR=%s", stagingDir))
-
-	// Add recipe-specific environment variables
-	for _, envVar := range recipe.Build.Env {
-		env = append(env, envVar)
-	}
 
 	// Add parallel build variable
 	env = append(env, fmt.Sprintf("MAKEFLAGS=-j%d", runtime.NumCPU()))
@@ -165,13 +197,11 @@ func (b *Builder) buildEnvironment(recipe *recipe.Recipe, stagingDir string) []s
 
 // executeCommand executes a single command
 func (b *Builder) executeCommand(workDir, command string, env []string) error {
-	// Parse command
-	args := strings.Fields(command)
-	if len(args) == 0 {
+	if strings.TrimSpace(command) == "" {
 		return nil
 	}
 
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = workDir
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
@@ -182,12 +212,11 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 
 // executeCommandWithOutput executes a command and returns output
 func (b *Builder) executeCommandWithOutput(workDir, command string, env []string) (string, error) {
-	args := strings.Fields(command)
-	if len(args) == 0 {
+	if strings.TrimSpace(command) == "" {
 		return "", nil
 	}
 
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = workDir
 	cmd.Env = env
 
@@ -217,10 +246,10 @@ func (b *Builder) GetBuildInfo(recipe *recipe.Recipe) (*BuildInfo, error) {
 	stagingDir := recipe.GetStagingDir(b.workDir)
 
 	info := &BuildInfo{
-		Recipe:      recipe,
-		SourceDir:   sourceDir,
-		StagingDir:  stagingDir,
-		SourceExists: false,
+		Recipe:        recipe,
+		SourceDir:     sourceDir,
+		StagingDir:    stagingDir,
+		SourceExists:  false,
 		StagingExists: false,
 	}
 
@@ -280,7 +309,7 @@ func (b *Builder) SetWorkDir(workDir string) {
 }
 
 // substituteVariables substitutes variables in command strings
-func (b *Builder) substituteVariables(cmdStr string, recipe *recipe.Recipe, sourceDir, stagingDir string) string {
+func (b *Builder) substituteVariables(cmdStr, sourceDir, stagingDir string) string {
 	// Get number of CPU cores
 	jobs := runtime.NumCPU()
 
@@ -288,12 +317,15 @@ func (b *Builder) substituteVariables(cmdStr string, recipe *recipe.Recipe, sour
 	cmdStr = strings.ReplaceAll(cmdStr, "${jobs}", fmt.Sprintf("%d", jobs))
 	cmdStr = strings.ReplaceAll(cmdStr, "${pkgdir}", stagingDir)
 	cmdStr = strings.ReplaceAll(cmdStr, "${srcdir}", sourceDir)
+	cmdStr = strings.ReplaceAll(cmdStr, "{{jobs}}", fmt.Sprintf("%d", jobs))
+	cmdStr = strings.ReplaceAll(cmdStr, "{{pkgdir}}", stagingDir)
+	cmdStr = strings.ReplaceAll(cmdStr, "{{srcdir}}", sourceDir)
 
 	return cmdStr
 }
 
 // packageFiles runs the package commands
-func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir, packageDir string) error {
+func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir string) error {
 	// Find the source directory (usually the first subdirectory)
 	srcPath, err := b.findSourceDirectory(sourceDir)
 	if err != nil {
@@ -301,13 +333,13 @@ func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir, pac
 	}
 
 	// Set up environment
-	env := b.buildEnvironment(recipe, stagingDir)
+	env := b.buildEnvironment(stagingDir)
 
 	// Execute package commands
-	for i, cmd := range recipe.Package.Commands {
+	for i, cmd := range recipe.Install {
 		// Substitute variables in command
-		cmd = b.substituteVariables(cmd, recipe, sourceDir, stagingDir)
-		
+		cmd = b.substituteVariables(cmd, sourceDir, stagingDir)
+
 		if err := b.executeCommand(srcPath, cmd, env); err != nil {
 			return fmt.Errorf("package command %d failed: %w", i+1, err)
 		}

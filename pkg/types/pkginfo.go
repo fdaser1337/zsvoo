@@ -1,11 +1,13 @@
 package types
 
+const PackageMetadataFile = ".zsvo.yml"
+
 // PkgInfo represents package metadata
 type PkgInfo struct {
-	Name        string   `toml:"name"`
-	Version     string   `toml:"version"`
-	Description string   `toml:"description,omitempty"`
-	Dependencies []string `toml:"dependencies,omitempty"`
-	Files       []string `toml:"files"`
-	InstallDate string   `toml:"install_date"`
+	Name         string   `yaml:"name"`
+	Version      string   `yaml:"version"`
+	Description  string   `yaml:"description,omitempty"`
+	Dependencies []string `yaml:"deps,omitempty"`
+	Files        []string `yaml:"files"`
+	InstallDate  string   `yaml:"install_date"`
 }

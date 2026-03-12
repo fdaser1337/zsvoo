@@ -1,0 +1,17 @@
+name: zlib
+version: "1.3"
+description: Compression library implementing deflate compression
+
+source:
+  url: https://zlib.net/fossils/zlib-1.3.tar.gz
+  sha256: ff0ba4c292013dbc27530b3a81e1f9a813cd39de01ca5e0f8bf355702efa593e
+
+build:
+  - ./configure --prefix=/usr --shared
+  - make -j$(nproc)
+
+install:
+  - make DESTDIR={{pkgdir}} install
+
+deps:
+  - glibc

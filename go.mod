@@ -3,7 +3,6 @@ module zsvo
 go 1.23.0
 
 require (
-	github.com/BurntSushi/toml v1.3.2
 	github.com/mholt/archiver/v3 v3.5.1
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/sync v0.12.0

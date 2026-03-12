@@ -19,19 +19,35 @@ var ListCmd = &cobra.Command{
 		}
 
 		i := installer.NewInstaller(rootDir)
+		orphansOnly, _ := cmd.Flags().GetBool("orphans")
 
-		// List installed packages
-		packages, err := i.ListInstalled()
+		var (
+			packages []string
+			err      error
+		)
+		if orphansOnly {
+			packages, err = i.ListOrphans()
+		} else {
+			packages, err = i.ListInstalled()
+		}
 		if err != nil {
 			return fmt.Errorf("failed to list packages: %w", err)
 		}
 
 		if len(packages) == 0 {
-			fmt.Println("No packages installed")
+			if orphansOnly {
+				fmt.Println("No orphan packages")
+			} else {
+				fmt.Println("No packages installed")
+			}
 			return nil
 		}
 
-		fmt.Println("Installed packages:")
+		if orphansOnly {
+			fmt.Println("Orphan packages:")
+		} else {
+			fmt.Println("Installed packages:")
+		}
 		for _, pkg := range packages {
 			fmt.Printf("  %s\n", pkg)
 		}
@@ -41,4 +57,5 @@ var ListCmd = &cobra.Command{
 
 func init() {
 	ListCmd.Flags().StringP("root", "r", "/", "Root directory for installation")
+	ListCmd.Flags().BoolP("orphans", "o", false, "List only orphan packages")
 }

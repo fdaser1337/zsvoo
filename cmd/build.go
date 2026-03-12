@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"zsvo/pkg/builder"
@@ -17,7 +18,7 @@ var BuildCmd = &cobra.Command{
 		recipePath := args[0]
 
 		// Parse recipe
-		recipe, err := recipe.ParseRecipe(recipePath)
+		rcp, err := recipe.ParseRecipe(recipePath)
 		if err != nil {
 			return fmt.Errorf("failed to parse recipe: %w", err)
 		}
@@ -31,12 +32,13 @@ var BuildCmd = &cobra.Command{
 		b := builder.NewBuilder(workDir)
 
 		// Build package
-		fmt.Printf("Building package %s...\n", recipe.GetPackageName())
-		if err := b.Build(recipe); err != nil {
+		fmt.Printf("Building package %s...\n", rcp.GetPackageName())
+		if err := b.Build(rcp); err != nil {
 			return fmt.Errorf("failed to build package: %w", err)
 		}
 
-		fmt.Printf("Package %s built successfully\n", recipe.GetPackageName())
+		fmt.Printf("Package %s built successfully\n", rcp.GetPackageName())
+		fmt.Printf("Package file: %s\n", filepath.Join(rcp.GetPackageDir(workDir), rcp.GetPackageFileName()))
 		return nil
 	},
 }

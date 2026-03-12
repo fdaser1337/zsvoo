@@ -1,13 +1,14 @@
 package packager
 
 import (
-	"bufio"
+	"archive/tar"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/mholt/archiver/v3"
 	"zsvo/pkg/recipe"
 	"zsvo/pkg/types"
@@ -74,19 +75,20 @@ func (p *Packager) Package(recipe *recipe.Recipe) error {
 		Name:         recipe.Name,
 		Version:      recipe.Version,
 		Description:  recipe.Description,
-		Dependencies: recipe.Dependencies,
+		Dependencies: recipe.Deps,
 		Files:        files,
 		InstallDate:  time.Now().Format(time.RFC3339),
 	}
 
 	// Create package info file
-	pkgInfoFile := filepath.Join(packageDir, ".pkginfo")
+	pkgInfoFile := filepath.Join(stagingDir, types.PackageMetadataFile)
 	if err := p.writePkgInfo(pkgInfoFile, pkgInfo); err != nil {
 		return fmt.Errorf("failed to write package info to %s: %w", pkgInfoFile, err)
 	}
+	defer os.Remove(pkgInfoFile)
 
 	// Create package archive
-	if err := p.createArchive(stagingDir, packageFile, pkgInfoFile); err != nil {
+	if err := p.createArchive(stagingDir, packageFile); err != nil {
 		return fmt.Errorf("failed to create package archive %s: %w", packageFile, err)
 	}
 
@@ -123,20 +125,76 @@ func (p *Packager) writePkgInfo(path string, pkgInfo *types.PkgInfo) error {
 	}
 	defer file.Close()
 
-	// Write package info in simple format
-	content := fmt.Sprintf(
-		"name = %q\nversion = %q\ndescription = %q\ndependencies = %v\nfiles = %v\ninstall_date = %q\n",
-		pkgInfo.Name, pkgInfo.Version, pkgInfo.Description, pkgInfo.Dependencies, pkgInfo.Files, pkgInfo.InstallDate,
-	)
-	_, err = file.WriteString(content)
-	return err
+	return types.WritePkgInfo(file, pkgInfo)
 }
 
 // createArchive creates a compressed archive
-func (p *Packager) createArchive(sourceDir, archivePath, pkgInfoFile string) error {
-	// Create archive using archiver.Archive
-	paths := []string{sourceDir, pkgInfoFile}
-	return archiver.Archive(paths, archivePath)
+func (p *Packager) createArchive(sourceDir, archivePath string) error {
+	outFile, err := os.Create(archivePath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	zstdWriter, err := zstd.NewWriter(outFile)
+	if err != nil {
+		return err
+	}
+	defer zstdWriter.Close()
+
+	tarWriter := tar.NewWriter(zstdWriter)
+	defer tarWriter.Close()
+
+	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == sourceDir {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		var linkTarget string
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err = os.Readlink(path)
+			if err != nil {
+				return err
+			}
+		}
+
+		header, err := tar.FileInfoHeader(info, linkTarget)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return err
+		}
+
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(tarWriter, file); err != nil {
+			file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+
+		return nil
+	})
 }
 
 // Extract extracts a package archive
@@ -164,9 +222,9 @@ func (p *Packager) ReadPkgInfo(archivePath string) (*types.PkgInfo, error) {
 	}
 
 	// Read package info
-	pkgInfoFile := filepath.Join(tmpDir, ".pkginfo")
+	pkgInfoFile := filepath.Join(tmpDir, types.PackageMetadataFile)
 
-	// Check if .pkginfo file exists
+	// Check if metadata file exists.
 	if _, err := os.Stat(pkgInfoFile); os.IsNotExist(err) {
 		return nil, fmt.Errorf("package info file not found in archive")
 	}
@@ -182,67 +240,7 @@ func (p *Packager) readPkgInfoFromFile(path string) (*types.PkgInfo, error) {
 	}
 	defer file.Close()
 
-	var pkgInfo types.PkgInfo
-	// Simple parser for our package info format
-	// In a real implementation, you'd want to use a proper TOML parser
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		// Remove quotes from value
-		value = strings.Trim(value, "\"")
-
-		switch key {
-		case "name":
-			pkgInfo.Name = value
-		case "version":
-			pkgInfo.Version = value
-		case "description":
-			pkgInfo.Description = value
-		case "dependencies":
-			// Parse dependencies array
-			value = strings.Trim(value, "[]")
-			if value != "" {
-				pkgInfo.Dependencies = strings.Split(value, ",")
-				for i, dep := range pkgInfo.Dependencies {
-					pkgInfo.Dependencies[i] = strings.TrimSpace(strings.Trim(dep, "\""))
-				}
-			}
-		case "files":
-			// Parse files array
-			value = strings.Trim(value, "[]")
-			if value != "" {
-				pkgInfo.Files = strings.Split(value, ",")
-				for i, file := range pkgInfo.Files {
-					pkgInfo.Files[i] = strings.TrimSpace(strings.Trim(file, "\""))
-				}
-			}
-		case "install_date":
-			pkgInfo.InstallDate = value
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	// Validate that we actually parsed some data
-	if pkgInfo.Name == "" {
-		return nil, fmt.Errorf("invalid package info: missing name")
-	}
-
-	return &pkgInfo, nil
+	return types.ReadPkgInfo(file)
 }
 
 // VerifyPackage verifies package integrity
@@ -294,16 +292,3 @@ func (p *Packager) Clean(recipe *recipe.Recipe) error {
 	packageDir := p.GetPackageDir(recipe)
 	return os.RemoveAll(packageDir)
 }
-
-// pkgInfoFileInfo implements os.FileInfo for package info
-type pkgInfoFileInfo struct {
-	name string
-	size int64
-}
-
-func (f *pkgInfoFileInfo) Name() string       { return f.name }
-func (f *pkgInfoFileInfo) Size() int64        { return f.size }
-func (f *pkgInfoFileInfo) Mode() os.FileMode  { return 0644 }
-func (f *pkgInfoFileInfo) ModTime() time.Time { return time.Now() }
-func (f *pkgInfoFileInfo) IsDir() bool        { return false }
-func (f *pkgInfoFileInfo) Sys() interface{}   { return nil }

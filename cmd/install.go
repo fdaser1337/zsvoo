@@ -8,13 +8,11 @@ import (
 )
 
 var InstallCmd = &cobra.Command{
-	Use:   "install <package>",
-	Short: "Install a package",
-	Long:  `Install a package from a package file`,
-	Args:  cobra.ExactArgs(1),
+	Use:   "install <package> [package...]",
+	Short: "Install package(s)",
+	Long:  `Install one or more packages from package files`,
+	Args:  cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		packagePath := args[0]
-
 		// Create installer
 		rootDir, _ := cmd.Flags().GetString("root")
 		if rootDir == "" {
@@ -23,13 +21,17 @@ var InstallCmd = &cobra.Command{
 
 		i := installer.NewInstaller(rootDir)
 
-		// Install package
-		fmt.Printf("Installing package from %s...\n", packagePath)
-		if err := i.Install(packagePath); err != nil {
-			return fmt.Errorf("failed to install package: %w", err)
+		// Install packages
+		if len(args) == 1 {
+			fmt.Printf("Installing package from %s...\n", args[0])
+		} else {
+			fmt.Printf("Installing %d packages...\n", len(args))
+		}
+		if err := i.InstallMany(args); err != nil {
+			return fmt.Errorf("failed to install packages: %w", err)
 		}
 
-		fmt.Printf("Package installed successfully\n")
+		fmt.Printf("Package installation completed successfully\n")
 		return nil
 	},
 }

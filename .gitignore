@@ -35,6 +35,7 @@ coverage.txt
 # Dependency directories
 vendor/
 node_modules/
+yay/
 
 # Environment files
 .env

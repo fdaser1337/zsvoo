@@ -1,14 +1,19 @@
 package fetcher
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/mholt/archiver/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 // Fetcher handles downloading and extracting sources
@@ -23,15 +28,13 @@ func NewFetcher(cacheDir string) *Fetcher {
 	}
 }
 
-// Download downloads a file from URL and verifies checksum
+// Download downloads a file from URL and verifies checksum when provided.
 func (f *Fetcher) Download(url, expectedHash string) (string, error) {
 	// Validate input parameters
 	if url == "" {
 		return "", fmt.Errorf("URL cannot be empty")
 	}
-	if expectedHash == "" {
-		return "", fmt.Errorf("expected hash cannot be empty")
-	}
+	expectedHash = strings.ToLower(strings.TrimSpace(expectedHash))
 
 	filename := filepath.Base(url)
 	if filename == "" {
@@ -40,9 +43,15 @@ func (f *Fetcher) Download(url, expectedHash string) (string, error) {
 
 	cachePath := filepath.Join(f.cacheDir, filename)
 
-	// Check if already downloaded and valid
-	if f.isValidCache(cachePath, expectedHash) {
-		return cachePath, nil
+	// Check if already downloaded and valid.
+	if expectedHash != "" {
+		if f.isValidCache(cachePath, expectedHash) {
+			return cachePath, nil
+		}
+	} else {
+		if _, err := os.Stat(cachePath); err == nil {
+			return cachePath, nil
+		}
 	}
 
 	// Create cache directory if it doesn't exist
@@ -66,22 +75,29 @@ func (f *Fetcher) Download(url, expectedHash string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer tmpFile.Close()
 
 	// Download to temp file
 	hasher := sha256.New()
-	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(tmpFile, hasher), resp.Body); err != nil {
+		_ = tmpFile.Close()
 		return "", fmt.Errorf("failed to download file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temp file: %w", err)
 	}
 
 	// Verify checksum
-	calculatedHash := fmt.Sprintf("%x", hasher.Sum(nil))
-	if calculatedHash != expectedHash {
-		return "", fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, calculatedHash)
+	if expectedHash != "" {
+		calculatedHash := fmt.Sprintf("%x", hasher.Sum(nil))
+		if calculatedHash != expectedHash {
+			_ = os.Remove(tmpFile.Name())
+			return "", fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, calculatedHash)
+		}
 	}
 
 	// Move temp file to final location
 	if err := os.Rename(tmpFile.Name(), cachePath); err != nil {
+		_ = os.Remove(tmpFile.Name())
 		return "", fmt.Errorf("failed to move downloaded file: %w", err)
 	}
 
@@ -128,42 +144,167 @@ func (f *Fetcher) ApplyPatches(sourceDir string, patchFiles []string) error {
 
 // applyPatch applies a single patch file
 func (f *Fetcher) applyPatch(sourceDir, patchFile string) error {
-	// This is a simplified patch application
-	// In a real implementation, you'd want to use the 'patch' command
-	// For now, we'll just copy the patch file to the source directory
-	patchDest := filepath.Join(sourceDir, filepath.Base(patchFile))
-	if err := copyFile(patchFile, patchDest); err != nil {
-		return fmt.Errorf("failed to copy patch file: %w", err)
-	}
-	return nil
-}
+	patchFile = filepath.Clean(patchFile)
 
-// copyFile copies a file from src to dst
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
+	// Try common strip levels used by patch files.
+	for _, stripLevel := range []string{"1", "0"} {
+		cmd := exec.Command("patch", "-p"+stripLevel, "-i", patchFile)
+		cmd.Dir = sourceDir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
 	}
-	defer sourceFile.Close()
 
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	return fmt.Errorf("failed to apply patch with -p1 and -p0: %s", patchFile)
 }
 
 // DownloadAndExtract downloads and extracts source
 func (f *Fetcher) DownloadAndExtract(url, expectedHash, destDir string) error {
+	if isDebianDSCURL(url) {
+		return f.downloadAndExtractFromDebianDSC(url, expectedHash, destDir)
+	}
+
 	archivePath, err := f.Download(url, expectedHash)
 	if err != nil {
 		return err
 	}
 
 	return f.Extract(archivePath, destDir)
+}
+
+func (f *Fetcher) downloadAndExtractFromDebianDSC(dscURL, dscHash, destDir string) error {
+	dscPath, err := f.Download(dscURL, dscHash)
+	if err != nil {
+		return fmt.Errorf("failed to download debian dsc: %w", err)
+	}
+
+	entries, err := parseDebianDSCSHA256Entries(dscPath)
+	if err != nil {
+		return err
+	}
+
+	origEntries := make([]debianDSCEntry, 0, len(entries))
+	for _, entry := range entries {
+		if isDebianOrigArchive(entry.Name) {
+			origEntries = append(origEntries, entry)
+		}
+	}
+	if len(origEntries) == 0 {
+		return fmt.Errorf("debian dsc does not contain upstream orig archive")
+	}
+
+	base, err := neturl.Parse(dscURL)
+	if err != nil {
+		return fmt.Errorf("invalid dsc URL %q: %w", dscURL, err)
+	}
+
+	for _, entry := range origEntries {
+		ref, err := neturl.Parse(entry.Name)
+		if err != nil {
+			return fmt.Errorf("invalid dsc entry filename %q: %w", entry.Name, err)
+		}
+
+		fileURL := base.ResolveReference(ref).String()
+		archivePath, err := f.Download(fileURL, entry.SHA256)
+		if err != nil {
+			return fmt.Errorf("failed to download upstream source %s: %w", entry.Name, err)
+		}
+		if err := f.Extract(archivePath, destDir); err != nil {
+			return fmt.Errorf("failed to extract upstream source %s: %w", entry.Name, err)
+		}
+	}
+
+	return nil
+}
+
+type debianDSCEntry struct {
+	Name   string
+	SHA256 string
+}
+
+func parseDebianDSCSHA256Entries(path string) ([]debianDSCEntry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open dsc file %s: %w", path, err)
+	}
+	defer file.Close()
+
+	var entries []debianDSCEntry
+	scanner := bufio.NewScanner(file)
+	inSHA256Section := false
+
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		if !inSHA256Section {
+			if strings.HasPrefix(trimmed, "Checksums-Sha256:") {
+				inSHA256Section = true
+			}
+			continue
+		}
+
+		if !isIndentedLine(line) {
+			break
+		}
+
+		fields := strings.Fields(trimmed)
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("invalid Checksums-Sha256 entry in dsc: %q", line)
+		}
+		entries = append(entries, debianDSCEntry{
+			SHA256: strings.ToLower(fields[0]),
+			Name:   fields[2],
+		})
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read dsc file %s: %w", path, err)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("debian dsc missing Checksums-Sha256 entries")
+	}
+
+	return entries, nil
+}
+
+func isIndentedLine(line string) bool {
+	if line == "" {
+		return false
+	}
+	return line[0] == ' ' || line[0] == '\t'
+}
+
+func isDebianOrigArchive(name string) bool {
+	idx := strings.Index(name, ".orig")
+	if idx < 0 {
+		return false
+	}
+
+	rest := name[idx+len(".orig"):]
+	if strings.HasPrefix(rest, ".tar.") {
+		return true
+	}
+	if strings.HasPrefix(rest, "-") && strings.Contains(rest, ".tar.") {
+		return true
+	}
+	return false
+}
+
+func isDebianDSCURL(raw string) bool {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return false
+	}
+	if idx := strings.IndexAny(raw, "?#"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return strings.HasSuffix(raw, ".dsc")
 }
 
 // DownloadMultiple downloads multiple files concurrently
@@ -173,12 +314,21 @@ func (f *Fetcher) DownloadMultiple(urls []string, hashes []string) ([]string, er
 	}
 
 	paths := make([]string, len(urls))
+	var g errgroup.Group
 	for i, url := range urls {
-		path, err := f.Download(url, hashes[i])
-		if err != nil {
-			return nil, err
-		}
-		paths[i] = path
+		i, url := i, url
+		g.Go(func() error {
+			path, err := f.Download(url, hashes[i])
+			if err != nil {
+				return err
+			}
+			paths[i] = path
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	return paths, nil

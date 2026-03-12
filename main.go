@@ -9,14 +9,15 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "pkg",
+	Use:   "zsvo",
 	Short: "A simple source-based package manager",
 	Long: `A minimal package manager for custom Linux distributions based on LFS
 
 Available commands:
   build     Build a package from recipe
-  install   Install a package from package file
-  remove    Remove an installed package
+  install   Install package(s) from package files
+  upgrade   Upgrade package(s) from package files
+  remove    Remove installed package(s)
   list      List installed packages
   info      Show package information
   help      Show help for a command
@@ -27,6 +28,7 @@ func init() {
 	// Register all commands
 	rootCmd.AddCommand(cmd.BuildCmd)
 	rootCmd.AddCommand(cmd.InstallCmd)
+	rootCmd.AddCommand(cmd.UpgradeCmd)
 	rootCmd.AddCommand(cmd.RemoveCmd)
 	rootCmd.AddCommand(cmd.ListCmd)
 	rootCmd.AddCommand(cmd.InfoCmd)
