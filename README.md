@@ -84,3 +84,13 @@ Notes:
 - `pkg/builder` — build/install pipeline in isolated workdir.
 - `pkg/packager` — create/read `name-version.pkg.tar.zst` from staging.
 - `pkg/installer` — install/remove packages into `--root` with file safety checks and rollback.
+
+
+
+
+
+короче бляяяя для тестов
+go build -o zsvo .
+./zsvo install fastfetch --work-dir /tmp/zsvo-work --root /tmp/zsvo-root
+find /tmp/zsvo-work/packages -name '*.pkg.tar.zst'
+find /tmp/zsvo-root/var/lib/pkgdb -maxdepth 3 -type f
