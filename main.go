@@ -15,7 +15,7 @@ var rootCmd = &cobra.Command{
 
 Available commands:
   build     Build a package from recipe
-  install   Install package(s) from package files
+  install   Install package(s) from local files or auto-build by name
   upgrade   Upgrade package(s) from package files
   remove    Remove installed package(s)
   list      List installed packages

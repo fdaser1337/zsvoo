@@ -86,6 +86,32 @@ func TestDownloadAndExtractDebianDSCChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestIsDebianOrigArchive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "pkg_1.0.orig.tar.gz", want: true},
+		{name: "pkg_1.0.orig.tar.xz", want: true},
+		{name: "pkg_1.0.orig.tar", want: true},
+		{name: "pkg_1.0.orig-data.tar.zst", want: true},
+		{name: "pkg_1.0-1.debian.tar.xz", want: false},
+		{name: "pkg_1.0-1.diff.gz", want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isDebianOrigArchive(tt.name); got != tt.want {
+				t.Fatalf("isDebianOrigArchive(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

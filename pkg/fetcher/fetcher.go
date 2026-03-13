@@ -287,13 +287,29 @@ func isDebianOrigArchive(name string) bool {
 	}
 
 	rest := name[idx+len(".orig"):]
-	if strings.HasPrefix(rest, ".tar.") {
+	if hasTarSuffix(rest) {
 		return true
 	}
-	if strings.HasPrefix(rest, "-") && strings.Contains(rest, ".tar.") {
-		return true
+	if strings.HasPrefix(rest, "-") {
+		tarIdx := strings.Index(rest, ".tar")
+		if tarIdx >= 0 {
+			componentTar := rest[tarIdx:]
+			if hasTarSuffix(componentTar) {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+func hasTarSuffix(s string) bool {
+	if !strings.HasPrefix(s, ".tar") {
+		return false
+	}
+	if len(s) == len(".tar") {
+		return true
+	}
+	return strings.HasPrefix(s[len(".tar"):], ".")
 }
 
 func isDebianDSCURL(raw string) bool {

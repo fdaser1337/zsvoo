@@ -15,6 +15,9 @@ zsvo build recipes/zlib.yaml
 # Install package built by zsvo
 zsvo install /path/to/name-version.pkg.tar.zst
 
+# Auto-build from Debian source and install
+zsvo install neofetch
+
 # Install to custom root
 zsvo install --root /mnt/root /path/to/name-version.pkg.tar.zst
 
@@ -71,6 +74,7 @@ Notes:
 - `deps` are simple package names (no version solver yet).
 - `{{pkgdir}}` (and `${pkgdir}`) points to staging DESTDIR.
 - If `source.debian_dsc` (or `.dsc` URL) is used, zsvo downloads only `*.orig*.tar.*` archives from that source package and ignores Debian patch archives (`debian.tar.*` / `diff.gz`).
+- `zsvo install <name>` auto-resolves Debian source over HTTP from Debian `Sources` indexes, builds package in `--work-dir` and installs it.
 - Package metadata is stored in `.zsvo.yml` (not `.PKGINFO`).
 
 ## Architecture
