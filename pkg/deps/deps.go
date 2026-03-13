@@ -298,20 +298,23 @@ func compareVersionPart(a, b string) int {
 
 	i, j := 0, 0
 	for i < len(a) || j < len(b) {
-		// Tilde sorts before everything, including end of string.
-		if i < len(a) && a[i] == '~' || j < len(b) && b[j] == '~' {
-			switch {
-			case i < len(a) && a[i] == '~' && j < len(b) && b[j] == '~':
-				i++
-				j++
-				continue
-			case i < len(a) && a[i] == '~':
-				return -1
-			default:
-				return 1
-			}
+		// Handle tilde comparison - tilde sorts before everything
+		aHasTilde := i < len(a) && a[i] == '~'
+		bHasTilde := j < len(b) && b[j] == '~'
+		
+		switch {
+		case aHasTilde && bHasTilde:
+			// Both have tilde, compare the rest
+			i++
+			j++
+			continue
+		case aHasTilde:
+			return -1 // a has tilde, sorts before b
+		case bHasTilde:
+			return 1  // b has tilde, sorts before a
 		}
 
+		// Skip separators
 		for i < len(a) && isVersionSeparator(a[i]) {
 			i++
 		}

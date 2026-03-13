@@ -122,6 +122,131 @@ func TestParseRequirements(t *testing.T) {
 	}
 }
 
+// Additional comprehensive tests for version comparison
+func TestCompareVersionsEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		a, b string
+		want int
+		desc string
+	}{
+		// Debian epoch tests
+		{"1:1.0", "1.0", 1, "epoch vs no epoch"},
+		{"2:1.0", "1:2.0", 1, "different epochs"},
+		{"0:1.0", "1.0", 0, "zero epoch explicit vs implicit"},
+		
+		// Tilde precedence tests
+		{"1.0~rc1", "1.0~rc2", -1, "tilde rc versions"},
+		{"1.0~rc1", "1.0", -1, "tilde vs final"},
+		{"1.0~alpha", "1.0~dev", -1, "tilde alpha vs dev"},
+		
+		// Complex version parts
+		{"1.2.3-4", "1.2.3-4ubuntu1", -1, "ubuntu suffix"},
+		{"1.2.3+dfsg1", "1.2.3+dfsg2", -1, "dfsg suffix"},
+		{"1.2.3-1+b1", "1.2.3-1", 1, "binNMU suffix"},
+		
+		// Numeric vs alphanumeric
+		{"1.0a", "1.0", 1, "alpha suffix"},
+		{"1.0beta", "1.0", 1, "beta suffix"},
+		{"1.0rc1", "1.0", 1, "rc suffix"},
+		
+		// Leading zeros
+		{"1.02", "1.002", 0, "leading zeros"},
+		{"1.010", "1.2", 1, "leading zeros comparison"},
+		
+		// Empty parts
+		{"1.0-", "1.0", 0, "empty release"},
+		{"1.0-0", "1.0", 0, "zero release"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := CompareVersions(tc.a, tc.b)
+			if sign(got) != sign(tc.want) {
+				t.Errorf("CompareVersions(%q, %q): want sign %d, got %d", tc.a, tc.b, sign(tc.want), sign(got))
+			}
+		})
+	}
+}
+
+func TestParseRequirementComplex(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		raw    string
+		expect Requirement
+		desc   string
+	}{
+		{
+			"pkg (>= 1.2.3) | otherpkg (= 2.0)",
+			Requirement{
+				Raw: "pkg (>= 1.2.3) | otherpkg (= 2.0)",
+				Alternatives: []Constraint{
+					{Name: "pkg", Op: OpGreaterOrEqual, Version: "1.2.3"},
+					{Name: "otherpkg", Op: OpEqual, Version: "2.0"},
+				},
+			},
+			"debian style with alternatives",
+		},
+		{
+			"complex-name+suffix_1.0",
+			Requirement{
+				Raw: "complex-name+suffix_1.0",
+				Alternatives: []Constraint{
+					{Name: "complex-name+suffix_1.0", Op: OpAny, Version: ""},
+				},
+			},
+			"complex package name",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := ParseRequirement(tc.raw)
+			if err != nil {
+				t.Fatalf("ParseRequirement(%q) error = %v", tc.raw, err)
+			}
+			if !reflect.DeepEqual(got, tc.expect) {
+				t.Errorf("ParseRequirement(%q):\nwant: %#v\ngot:  %#v", tc.raw, tc.expect, got)
+			}
+		})
+	}
+}
+
+// Property-based test for version comparison transitivity
+func TestCompareVersionsTransitivity(t *testing.T) {
+	t.Parallel()
+
+	versions := []string{
+		"1.0", "1.0~rc1", "1.0~dev", "1.1", "2.0",
+		"1:1.0", "1:0.9", "1.0-1", "1.0-2",
+	}
+
+	for i, a := range versions {
+		for j, b := range versions {
+			for k, c := range versions {
+				if i == j || j == k || i == k {
+					continue
+				}
+				
+				ab := CompareVersions(a, b)
+				bc := CompareVersions(b, c)
+				ac := CompareVersions(a, c)
+				
+				// If a > b and b > c, then a > c
+				if ab > 0 && bc > 0 && ac <= 0 {
+					t.Errorf("Transitivity violation: %s > %s and %s > %s but %s <= %s", a, b, b, c, a, c)
+				}
+				// If a == b and b == c, then a == c
+				if ab == 0 && bc == 0 && ac != 0 {
+					t.Errorf("Transitivity violation: %s == %s and %s == %s but %s != %s", a, b, b, c, a, c)
+				}
+			}
+		}
+	}
+}
+
 func sign(v int) int {
 	switch {
 	case v < 0:

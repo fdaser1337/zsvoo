@@ -35,6 +35,7 @@ var InstallCmd = &cobra.Command{
 		}
 		autoSource, _ := cmd.Flags().GetBool("auto-source")
 		autoBuildDeps, _ := cmd.Flags().GetBool("auto-build-deps")
+		autoResolveDeps, _ := cmd.Flags().GetBool("auto-resolve-deps")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 
 		if dryRun {
@@ -45,6 +46,7 @@ var InstallCmd = &cobra.Command{
 			status.PrintInfo(fmt.Sprintf("Work directory: %s", workDir))
 			status.PrintInfo(fmt.Sprintf("Auto-source: %t", autoSource))
 			status.PrintInfo(fmt.Sprintf("Auto-build-deps: %t", autoBuildDeps))
+			status.PrintInfo(fmt.Sprintf("Auto-resolve-deps: %t", autoResolveDeps))
 			status.PrintFooter()
 		}
 
@@ -121,7 +123,22 @@ var InstallCmd = &cobra.Command{
 			return nil
 		}
 
-		if err := i.InstallMany(installTargets); err != nil {
+		// Choose installation method based on flags
+		var err error
+		if autoResolveDeps {
+			// Build search paths for dependency resolution
+			searchPaths := []string{
+				filepath.Join(workDir, "packages"),
+				"/var/cache/packages",
+				filepath.Join(rootDir, "var/cache/packages"),
+			}
+			
+			err = i.InstallWithAutoResolve(installTargets, searchPaths)
+		} else {
+			err = i.InstallMany(installTargets)
+		}
+
+		if err != nil {
 			return fmt.Errorf("failed to install packages: %w", err)
 		}
 
@@ -135,7 +152,8 @@ func init() {
 	InstallCmd.Flags().StringP("work-dir", "w", "/tmp/pkg-work", "Working directory for source builds")
 	InstallCmd.Flags().Bool("auto-source", true, "Auto-build package names from Debian source")
 	InstallCmd.Flags().Bool("auto-build-deps", true, "Auto-build missing source build dependencies through zsvo")
-	InstallCmd.Flags().Bool("dry-run", false, "Show what would be done without executing")
+	InstallCmd.Flags().Bool("auto-resolve-deps", false, "Automatically resolve and install dependencies from available packages")
+	InstallCmd.Flags().Bool("dry-run", false, "Show what would be done without making changes")
 }
 
 func isInstallFileTarget(target string) (bool, error) {
@@ -457,6 +475,18 @@ func inferMissingBuildDeps(err error) []string {
 		found["gcc"] = struct{}{}
 	}
 
+	// Detect missing source files
+	if strings.Contains(lowerText, "cannot find source file") ||
+		strings.Contains(lowerText, "no sources given to target") ||
+		strings.Contains(lowerText, "cmake generate step failed") {
+		found["cmake"] = struct{}{}
+	}
+
+	// Detect missing submodules/sources
+	if strings.Contains(lowerText, "yyjson.c") || strings.Contains(lowerText, "3rdparty") {
+		found["git"] = struct{}{}
+	}
+
 	if len(found) == 0 {
 		return nil
 	}
@@ -493,6 +523,8 @@ func mapToolToSourcePackage(tool string) string {
 		return "binutils"
 	case "xzcat":
 		return "xz-utils"
+	case "git":
+		return "git"
 	}
 
 	if !simplePkgNamePattern.MatchString(tool) {

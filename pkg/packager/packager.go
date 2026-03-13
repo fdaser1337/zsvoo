@@ -132,20 +132,39 @@ func (p *Packager) writePkgInfo(path string, pkgInfo *types.PkgInfo) error {
 func (p *Packager) createArchive(sourceDir, archivePath string) error {
 	outFile, err := os.Create(archivePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create archive file: %w", err)
 	}
-	defer outFile.Close()
+	
+	// Ensure file is closed on error
+	var closeErr error
+	defer func() {
+		if cerr := outFile.Close(); cerr != nil {
+			closeErr = cerr
+		}
+		// Remove partial file on error
+		if err != nil || closeErr != nil {
+			os.Remove(archivePath)
+		}
+	}()
 
 	zstdWriter, err := zstd.NewWriter(outFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create zstd writer: %w", err)
 	}
-	defer zstdWriter.Close()
+	defer func() {
+		if cerr := zstdWriter.Close(); cerr != nil {
+			closeErr = cerr
+		}
+	}()
 
 	tarWriter := tar.NewWriter(zstdWriter)
-	defer tarWriter.Close()
+	defer func() {
+		if cerr := tarWriter.Close(); cerr != nil {
+			closeErr = cerr
+		}
+	}()
 
-	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
+	walkErr := filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -155,7 +174,7 @@ func (p *Packager) createArchive(sourceDir, archivePath string) error {
 
 		relPath, err := filepath.Rel(sourceDir, path)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get relative path for %s: %w", path, err)
 		}
 		relPath = filepath.ToSlash(relPath)
 
@@ -163,18 +182,18 @@ func (p *Packager) createArchive(sourceDir, archivePath string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			linkTarget, err = os.Readlink(path)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to read symlink %s: %w", path, err)
 			}
 		}
 
 		header, err := tar.FileInfoHeader(info, linkTarget)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to create tar header for %s: %w", path, err)
 		}
 		header.Name = relPath
 
 		if err := tarWriter.WriteHeader(header); err != nil {
-			return err
+			return fmt.Errorf("failed to write tar header for %s: %w", path, err)
 		}
 
 		if !info.Mode().IsRegular() {
@@ -183,18 +202,24 @@ func (p *Packager) createArchive(sourceDir, archivePath string) error {
 
 		file, err := os.Open(path)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to open file %s: %w", path, err)
 		}
-		if _, err := io.Copy(tarWriter, file); err != nil {
-			file.Close()
-			return err
-		}
-		if err := file.Close(); err != nil {
-			return err
-		}
+		defer file.Close()
 
+		if _, err := io.Copy(tarWriter, file); err != nil {
+			return fmt.Errorf("failed to copy file %s to archive: %w", path, err)
+		}
 		return nil
 	})
+
+	if walkErr != nil {
+		return walkErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+
+	return nil
 }
 
 // Extract extracts a package archive

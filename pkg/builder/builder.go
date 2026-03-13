@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"zsvo/pkg/fetcher"
 	"zsvo/pkg/packager"
@@ -20,6 +21,7 @@ type Builder struct {
 	quiet            bool
 	progressCallback func(BuildProgress)
 	envOverrides     map[string]string
+	callbackMutex    sync.RWMutex
 }
 
 // BuildProgress represents build progress state.
@@ -378,6 +380,8 @@ func (b *Builder) SetQuiet(quiet bool) {
 
 // SetProgressCallback sets callback for build progress updates.
 func (b *Builder) SetProgressCallback(callback func(BuildProgress)) {
+	b.callbackMutex.Lock()
+	defer b.callbackMutex.Unlock()
 	b.progressCallback = callback
 }
 
@@ -518,10 +522,14 @@ func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir stri
 }
 
 func (b *Builder) reportProgress(step, total int, message string) {
-	if b.progressCallback == nil {
+	b.callbackMutex.RLock()
+	callback := b.progressCallback
+	b.callbackMutex.RUnlock()
+	
+	if callback == nil {
 		return
 	}
-	b.progressCallback(BuildProgress{
+	callback(BuildProgress{
 		Step:    step,
 		Total:   total,
 		Message: message,

@@ -79,14 +79,26 @@ func ParseRecipeFromReader(r io.Reader) (*Recipe, error) {
 
 			switch section {
 			case "build":
+				if item == "" {
+					return nil, fmt.Errorf("build command cannot be empty at line %d", lineNo)
+				}
 				rcp.Build = append(rcp.Build, item)
 			case "install":
+				if item == "" {
+					return nil, fmt.Errorf("install command cannot be empty at line %d", lineNo)
+				}
 				rcp.Install = append(rcp.Install, item)
 			case "deps":
+				if item == "" {
+					return nil, fmt.Errorf("dependency cannot be empty at line %d", lineNo)
+				}
 				rcp.Deps = append(rcp.Deps, item)
 			case "source":
 				if sourceSubsection != "patches" {
 					return nil, fmt.Errorf("unexpected source list item at line %d", lineNo)
+				}
+				if item == "" {
+					return nil, fmt.Errorf("patch path cannot be empty at line %d", lineNo)
 				}
 				rcp.Source.Patches = append(rcp.Source.Patches, item)
 			default:

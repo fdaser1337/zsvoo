@@ -3,6 +3,9 @@ zsvo
 pkg-manager
 
 # Build artifacts
+dist/
+release/
+bin/
 *.exe
 *.dll
 *.so
@@ -25,14 +28,6 @@ Thumbs.db
 
 # Cache directories
 .cache/
-tmp/
-temp/
-
-# Test coverage
-coverage.txt
-*.coverprofile
-
-# Dependency directories
 vendor/
 node_modules/
 yay/
@@ -48,13 +43,28 @@ yay/
 *.backup
 *.orig
 
-# Docker and deployment scripts
-zsvo-docker.sh
-*.sh
-deploy/
-docker-compose.yml
+# Test coverage
+coverage.txt
+*.coverprofile
+coverage.html
+
+# Go specific
+*.test
+*.prof
 
 # Work directories
 /tmp/pkg-work/
 /tmp/zsvo-cache/
 *.pkg.tar.zst
+work/
+
+# Docker
+.dockerignore
+
+# Scripts output
+scripts/*.log
+scripts/*.tmp
+
+# Allow scripts directory
+!scripts/
+!scripts/*.sh
