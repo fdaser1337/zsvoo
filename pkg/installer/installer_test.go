@@ -142,6 +142,132 @@ func TestInstallManyRollsBackOnFailure(t *testing.T) {
 	}
 }
 
+func TestInstallManyRespectsVersionConstraints(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	rootDir := t.TempDir()
+	ins := NewInstaller(rootDir)
+
+	libPkg := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "libfoo",
+		Version: "2.1.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+	}, map[string][]byte{"usr/lib/libfoo.so": []byte("lib2\n")})
+
+	appPkg := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "app",
+		Version: "1.0.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+		Deps:    []string{"libfoo>=2.0.0"},
+	}, map[string][]byte{"usr/bin/app": []byte("app\n")})
+
+	if err := ins.InstallMany([]string{appPkg, libPkg}); err != nil {
+		t.Fatalf("InstallMany() error = %v", err)
+	}
+	if !ins.IsInstalled("libfoo") || !ins.IsInstalled("app") {
+		t.Fatalf("expected libfoo and app to be installed")
+	}
+}
+
+func TestInstallManyFailsOnUnsatisfiedVersionConstraint(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	rootDir := t.TempDir()
+	ins := NewInstaller(rootDir)
+
+	libOld := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "libfoo",
+		Version: "1.0.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+	}, map[string][]byte{"usr/lib/libfoo.so": []byte("lib1\n")})
+	if err := ins.Install(libOld); err != nil {
+		t.Fatalf("Install(libOld) error = %v", err)
+	}
+
+	appPkg := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "app",
+		Version: "1.0.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+		Deps:    []string{"libfoo>=2.0.0"},
+	}, map[string][]byte{"usr/bin/app": []byte("app\n")})
+
+	err := ins.Install(appPkg)
+	if err == nil {
+		t.Fatalf("expected install error for unsatisfied version constraint")
+	}
+	if !strings.Contains(err.Error(), "libfoo>=2.0.0") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInstallManySupportsAlternativeDependencies(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	rootDir := t.TempDir()
+	ins := NewInstaller(rootDir)
+
+	libBarPkg := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "libbar",
+		Version: "1.5.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+	}, map[string][]byte{"usr/lib/libbar.so": []byte("bar\n")})
+
+	appPkg := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "app",
+		Version: "1.0.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+		Deps:    []string{"libfoo | libbar>=1.2.0"},
+	}, map[string][]byte{"usr/bin/app": []byte("app\n")})
+
+	if err := ins.InstallMany([]string{appPkg, libBarPkg}); err != nil {
+		t.Fatalf("InstallMany() error = %v", err)
+	}
+	if !ins.IsInstalled("libbar") || !ins.IsInstalled("app") {
+		t.Fatalf("expected libbar and app to be installed")
+	}
+}
+
+func TestInstallManyDetectsDependencyCycle(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	rootDir := t.TempDir()
+	ins := NewInstaller(rootDir)
+
+	pkgA := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "a",
+		Version: "1.0.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+		Deps:    []string{"b>=1.0"},
+	}, map[string][]byte{"usr/bin/a": []byte("a\n")})
+
+	pkgB := buildTestPackage(t, workDir, &recipe.Recipe{
+		Name:    "b",
+		Version: "1.0.0",
+		Build:   []string{"true"},
+		Install: []string{"true"},
+		Deps:    []string{"a>=1.0"},
+	}, map[string][]byte{"usr/bin/b": []byte("b\n")})
+
+	err := ins.InstallMany([]string{pkgA, pkgB})
+	if err == nil {
+		t.Fatalf("expected cycle error")
+	}
+	if !strings.Contains(err.Error(), "dependency cycle") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestInstallRespectsRootFlag(t *testing.T) {
 	t.Parallel()
 
@@ -219,6 +345,43 @@ func TestRemoveManyCascade(t *testing.T) {
 	}
 }
 
+func TestRemoveManyAllowsAlternativeDependencyProvider(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	ins := NewInstaller(rootDir)
+
+	libFoo := &types.PkgInfo{Name: "libfoo", Version: "1.0.0", Files: []string{"usr/lib/libfoo.so"}}
+	libBar := &types.PkgInfo{Name: "libbar", Version: "1.0.0", Files: []string{"usr/lib/libbar.so"}}
+	app := &types.PkgInfo{
+		Name:         "app",
+		Version:      "1.0.0",
+		Dependencies: []string{"libfoo | libbar"},
+		Files:        []string{"usr/bin/app"},
+	}
+
+	if err := ins.registerPackage(libFoo); err != nil {
+		t.Fatalf("registerPackage(libFoo) error = %v", err)
+	}
+	if err := ins.registerPackage(libBar); err != nil {
+		t.Fatalf("registerPackage(libBar) error = %v", err)
+	}
+	if err := ins.registerPackage(app); err != nil {
+		t.Fatalf("registerPackage(app) error = %v", err)
+	}
+
+	removed, err := ins.RemoveMany([]string{"libfoo"}, RemoveOptions{})
+	if err != nil {
+		t.Fatalf("RemoveMany() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "libfoo" {
+		t.Fatalf("unexpected removed list: %#v", removed)
+	}
+	if !ins.IsInstalled("app") {
+		t.Fatalf("app should remain installed because libbar satisfies dependency")
+	}
+}
+
 func TestListOrphans(t *testing.T) {
 	t.Parallel()
 
@@ -254,6 +417,47 @@ func TestListOrphans(t *testing.T) {
 	}
 	if _, ok := set["tool"]; !ok {
 		t.Fatalf("expected tool to be orphan")
+	}
+	if _, ok := set["libfoo"]; ok {
+		t.Fatalf("did not expect libfoo to be orphan")
+	}
+}
+
+func TestListOrphansAlternativeDependencyMarksChosenProvider(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	ins := NewInstaller(rootDir)
+
+	libFoo := &types.PkgInfo{Name: "libfoo", Version: "1.0.0"}
+	libBar := &types.PkgInfo{Name: "libbar", Version: "1.0.0"}
+	app := &types.PkgInfo{Name: "app", Version: "1.0.0", Dependencies: []string{"libfoo | libbar"}}
+
+	if err := ins.registerPackage(libFoo); err != nil {
+		t.Fatalf("registerPackage(libFoo) error = %v", err)
+	}
+	if err := ins.registerPackage(libBar); err != nil {
+		t.Fatalf("registerPackage(libBar) error = %v", err)
+	}
+	if err := ins.registerPackage(app); err != nil {
+		t.Fatalf("registerPackage(app) error = %v", err)
+	}
+
+	orphans, err := ins.ListOrphans()
+	if err != nil {
+		t.Fatalf("ListOrphans() error = %v", err)
+	}
+
+	set := make(map[string]struct{}, len(orphans))
+	for _, name := range orphans {
+		set[name] = struct{}{}
+	}
+
+	if _, ok := set["app"]; !ok {
+		t.Fatalf("expected app to be orphan")
+	}
+	if _, ok := set["libbar"]; !ok {
+		t.Fatalf("expected libbar to be orphan when libfoo is first satisfiable provider")
 	}
 	if _, ok := set["libfoo"]; ok {
 		t.Fatalf("did not expect libfoo to be orphan")

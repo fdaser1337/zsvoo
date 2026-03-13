@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"zsvo/pkg/debian"
@@ -67,5 +70,60 @@ func TestAutoRecipeFromDebian(t *testing.T) {
 	}
 	if len(r.Build) == 0 || len(r.Install) == 0 {
 		t.Fatalf("expected auto recipe build/install commands")
+	}
+	if !strings.Contains(r.Build[0], "autogen.sh --no-check") {
+		t.Fatalf("expected auto recipe to support autogen fallback, got: %s", r.Build[0])
+	}
+}
+
+func TestBuildFailureHintForLua(t *testing.T) {
+	t.Parallel()
+
+	msg := buildFailureHint("neovim", errors.New("Failed to find a Lua 5.1-compatible interpreter"))
+	if !strings.Contains(strings.ToLower(msg), "lua") {
+		t.Fatalf("expected lua hint, got: %q", msg)
+	}
+}
+
+func TestInferMissingBuildDeps_FromCommandNotFound(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("sh: cmake: command not found\n/bin/sh: 1: pkg-config: not found")
+	got := inferMissingBuildDeps(err)
+	want := []string{"cmake", "pkgconf"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("inferMissingBuildDeps() mismatch:\nwant: %#v\ngot:  %#v", want, got)
+	}
+}
+
+func TestInferMissingBuildDeps_FromLuaError(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("CMake Error: Failed to find a Lua 5.1-compatible interpreter")
+	got := inferMissingBuildDeps(err)
+	want := []string{"lua5.1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("inferMissingBuildDeps() mismatch:\nwant: %#v\ngot:  %#v", want, got)
+	}
+}
+
+func TestMapToolToSourcePackage(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"pkg-config": "pkgconf",
+		"ninja":      "ninja-build",
+		"python":     "python3",
+		"lua":        "lua5.1",
+		"cmake":      "cmake",
+		"bash":       "",
+		"1":          "",
+		"":           "",
+	}
+
+	for input, want := range cases {
+		if got := mapToolToSourcePackage(input); got != want {
+			t.Fatalf("mapToolToSourcePackage(%q): want %q, got %q", input, want, got)
+		}
 	}
 }

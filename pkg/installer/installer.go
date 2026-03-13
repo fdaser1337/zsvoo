@@ -1,6 +1,7 @@
 package installer
 
 import (
+	"container/heap"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"zsvo/pkg/deps"
 	"zsvo/pkg/packager"
 	"zsvo/pkg/types"
 )
@@ -153,48 +155,22 @@ func (i *Installer) installManyNoLock(packagePaths []string) error {
 	defer os.RemoveAll(txDir)
 
 	applied := make([]installTransactionState, 0, len(candidates))
-	remaining := append([]installCandidate(nil), candidates...)
+	ordered, err := solveInstallOrder(candidates, installedInfos)
+	if err != nil {
+		return err
+	}
 
-	for len(remaining) > 0 {
-		progress := false
-		for idx, candidate := range remaining {
-			if !depsSatisfied(candidate.info.Dependencies, installedInfos, candidate.info.Name) {
-				continue
+	for _, candidate := range ordered {
+		state, err := i.installPackageTxNoLock(candidate.path, txDir, installedInfos)
+		if err != nil {
+			if rbErr := i.rollbackInstallTransactionNoLock(applied); rbErr != nil {
+				return fmt.Errorf("install failed for %s: %w (rollback error: %v)", candidate.info.Name, err, rbErr)
 			}
-
-			state, err := i.installPackageTxNoLock(candidate.path, txDir, installedInfos)
-			if err != nil {
-				if rbErr := i.rollbackInstallTransactionNoLock(applied); rbErr != nil {
-					return fmt.Errorf("install failed for %s: %w (rollback error: %v)", candidate.info.Name, err, rbErr)
-				}
-				return fmt.Errorf("install failed for %s: %w", candidate.info.Name, err)
-			}
-
-			applied = append(applied, *state)
-			installedInfos[candidate.info.Name] = candidate.info
-			remaining = append(remaining[:idx], remaining[idx+1:]...)
-			progress = true
-			break
+			return fmt.Errorf("install failed for %s: %w", candidate.info.Name, err)
 		}
 
-		if progress {
-			continue
-		}
-
-		block := remaining[0]
-		missing := missingDeps(block.info.Dependencies, installedInfos, block.info.Name)
-		if len(missing) == 0 {
-			missing = []string{"unknown ordering issue"}
-		}
-		if rbErr := i.rollbackInstallTransactionNoLock(applied); rbErr != nil {
-			return fmt.Errorf(
-				"cannot resolve install order for %s: missing deps %s (rollback error: %v)",
-				block.info.Name,
-				strings.Join(missing, ", "),
-				rbErr,
-			)
-		}
-		return fmt.Errorf("cannot resolve install order for %s: missing deps %s", block.info.Name, strings.Join(missing, ", "))
+		applied = append(applied, *state)
+		installedInfos[candidate.info.Name] = candidate.info
 	}
 
 	return nil
@@ -844,47 +820,50 @@ func removePathIfExists(path string) error {
 	return nil
 }
 
-func validateSimpleDependencies(deps []string) error {
-	for _, dep := range deps {
-		if depNameFromConstraint(dep) == "" {
-			return fmt.Errorf("invalid dependency: %q", dep)
-		}
+func validateSimpleDependencies(rawDeps []string) error {
+	if _, err := deps.ParseRequirements(rawDeps); err != nil {
+		return err
 	}
 	return nil
 }
 
-func depsSatisfied(deps []string, installedInfos map[string]*types.PkgInfo, selfName string) bool {
-	for _, dep := range deps {
-		depName := depNameFromConstraint(dep)
-		if depName == "" {
-			return false
-		}
-		if depName == selfName {
-			continue
-		}
-		if _, ok := installedInfos[depName]; !ok {
+func depsSatisfied(rawDeps []string, installedInfos map[string]*types.PkgInfo, selfName string) bool {
+	reqs, err := deps.ParseRequirements(rawDeps)
+	if err != nil {
+		return false
+	}
+
+	available := packageVersions(installedInfos)
+	for _, req := range reqs {
+		if _, ok := resolveRequirementProvider(req, available, nil, selfName); !ok {
 			return false
 		}
 	}
 	return true
 }
 
-func missingDeps(deps []string, installedInfos map[string]*types.PkgInfo, selfName string) []string {
+func missingDeps(rawDeps []string, installedInfos map[string]*types.PkgInfo, selfName string) []string {
+	reqs, err := deps.ParseRequirements(rawDeps)
+	if err != nil {
+		return []string{err.Error()}
+	}
+
 	missing := make([]string, 0)
 	seen := make(map[string]struct{})
-	for _, dep := range deps {
-		depName := depNameFromConstraint(dep)
-		if depName == "" || depName == selfName {
+	available := packageVersions(installedInfos)
+	for _, req := range reqs {
+		if _, ok := resolveRequirementProvider(req, available, nil, selfName); ok {
 			continue
 		}
-		if _, ok := installedInfos[depName]; ok {
+		label := req.Raw
+		if label == "" {
+			label = formatRequirement(req)
+		}
+		if _, exists := seen[label]; exists {
 			continue
 		}
-		if _, exists := seen[depName]; exists {
-			continue
-		}
-		seen[depName] = struct{}{}
-		missing = append(missing, depName)
+		seen[label] = struct{}{}
+		missing = append(missing, label)
 	}
 	sort.Strings(missing)
 	return missing
@@ -899,27 +878,6 @@ func checkDependenciesAgainstInstalled(deps []string, installedInfos map[string]
 		return fmt.Errorf("dependency check failed")
 	}
 	return fmt.Errorf("dependency not installed: %s", strings.Join(missing, ", "))
-}
-
-func depNameFromConstraint(dep string) string {
-	dep = strings.TrimSpace(dep)
-	if dep == "" {
-		return ""
-	}
-
-	if idx := strings.Index(dep, "|"); idx >= 0 {
-		dep = strings.TrimSpace(dep[:idx])
-	}
-
-	for idx, r := range dep {
-		switch r {
-		case '<', '>', '=', ' ', '\t', '\n', '\r':
-			dep = strings.TrimSpace(dep[:idx])
-			return dep
-		}
-	}
-
-	return dep
 }
 
 func normalizePackageNames(packageNames []string) ([]string, error) {
@@ -961,17 +919,15 @@ func brokenPackagesAfterRemoval(infos map[string]*types.PkgInfo, removeSet map[s
 	sort.Strings(names)
 
 	broken := make([]string, 0)
+	remainingVersions := packageVersions(remaining)
 	for _, pkgName := range names {
 		pkgInfo := remaining[pkgName]
-		for _, dep := range pkgInfo.Dependencies {
-			depName := depNameFromConstraint(dep)
-			if depName == "" {
-				return nil, fmt.Errorf("invalid dependency in package %s: %q", pkgName, dep)
-			}
-			if depName == pkgName {
-				continue
-			}
-			if _, ok := remaining[depName]; !ok {
+		reqs, err := deps.ParseRequirements(pkgInfo.Dependencies)
+		if err != nil {
+			return nil, fmt.Errorf("invalid dependency in package %s: %w", pkgName, err)
+		}
+		for _, req := range reqs {
+			if _, ok := resolveRequirementProvider(req, remainingVersions, nil, pkgName); !ok {
 				broken = append(broken, pkgName)
 				break
 			}
@@ -983,15 +939,18 @@ func brokenPackagesAfterRemoval(infos map[string]*types.PkgInfo, removeSet map[s
 
 func listOrphansFromInfos(infos map[string]*types.PkgInfo) []string {
 	required := make(map[string]struct{})
+	versions := packageVersions(infos)
 	for owner, info := range infos {
-		for _, dep := range info.Dependencies {
-			depName := depNameFromConstraint(dep)
-			if depName == "" || depName == owner {
+		reqs, err := deps.ParseRequirements(info.Dependencies)
+		if err != nil {
+			continue
+		}
+		for _, req := range reqs {
+			provider, ok := resolveRequirementProvider(req, versions, nil, owner)
+			if !ok || provider == owner {
 				continue
 			}
-			if _, ok := infos[depName]; ok {
-				required[depName] = struct{}{}
-			}
+			required[provider] = struct{}{}
 		}
 	}
 
@@ -1003,6 +962,191 @@ func listOrphansFromInfos(infos map[string]*types.PkgInfo) []string {
 	}
 	sort.Strings(orphans)
 	return orphans
+}
+
+func solveInstallOrder(candidates []installCandidate, installedInfos map[string]*types.PkgInfo) ([]installCandidate, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	candidateByName := make(map[string]installCandidate, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.info == nil {
+			return nil, fmt.Errorf("invalid install candidate: nil metadata")
+		}
+		if prev, exists := candidateByName[candidate.info.Name]; exists {
+			return nil, fmt.Errorf("duplicate package %s in transaction: %s and %s", candidate.info.Name, prev.path, candidate.path)
+		}
+		candidateByName[candidate.info.Name] = candidate
+	}
+
+	available := packageVersions(installedInfos)
+	for _, candidate := range candidates {
+		available[candidate.info.Name] = candidate.info.Version
+	}
+
+	indegree := make(map[string]int, len(candidates))
+	dependents := make(map[string][]string, len(candidates))
+	for _, candidate := range candidates {
+		indegree[candidate.info.Name] = 0
+	}
+
+	for _, candidate := range candidates {
+		reqs, err := deps.ParseRequirements(candidate.info.Dependencies)
+		if err != nil {
+			return nil, fmt.Errorf("invalid dependencies in %s: %w", candidate.info.Name, err)
+		}
+
+		edgeSet := make(map[string]struct{})
+		for _, req := range reqs {
+			provider, ok := resolveRequirementProvider(req, available, candidateByName, candidate.info.Name)
+			if !ok {
+				return nil, fmt.Errorf("cannot resolve dependencies for %s: missing %s", candidate.info.Name, req.Raw)
+			}
+			if provider == candidate.info.Name {
+				continue
+			}
+			if _, inTx := candidateByName[provider]; !inTx {
+				continue
+			}
+			if _, seen := edgeSet[provider]; seen {
+				continue
+			}
+			edgeSet[provider] = struct{}{}
+			dependents[provider] = append(dependents[provider], candidate.info.Name)
+			indegree[candidate.info.Name]++
+		}
+	}
+
+	ready := &stringMinHeap{}
+	heap.Init(ready)
+	for name, deg := range indegree {
+		if deg == 0 {
+			heap.Push(ready, name)
+		}
+	}
+
+	ordered := make([]installCandidate, 0, len(candidates))
+	for ready.Len() > 0 {
+		name := heap.Pop(ready).(string)
+		ordered = append(ordered, candidateByName[name])
+
+		next := dependents[name]
+		sort.Strings(next)
+		for _, depName := range next {
+			indegree[depName]--
+			if indegree[depName] == 0 {
+				heap.Push(ready, depName)
+			}
+		}
+	}
+
+	if len(ordered) != len(candidates) {
+		stuck := make([]string, 0)
+		for name, deg := range indegree {
+			if deg > 0 {
+				stuck = append(stuck, name)
+			}
+		}
+		sort.Strings(stuck)
+		return nil, fmt.Errorf("cannot resolve install order: dependency cycle among %s", strings.Join(stuck, ", "))
+	}
+
+	return ordered, nil
+}
+
+func packageVersions(infos map[string]*types.PkgInfo) map[string]string {
+	out := make(map[string]string, len(infos))
+	for name, info := range infos {
+		if info == nil {
+			continue
+		}
+		out[name] = info.Version
+	}
+	return out
+}
+
+func resolveRequirementProvider(
+	req deps.Requirement,
+	availableVersions map[string]string,
+	candidateByName map[string]installCandidate,
+	selfName string,
+) (string, bool) {
+	for _, alt := range req.Alternatives {
+		version, ok := availableVersions[alt.Name]
+		if !ok {
+			continue
+		}
+		if alt.Name == selfName && candidateByName != nil {
+			if selfCandidate, exists := candidateByName[selfName]; exists {
+				version = selfCandidate.info.Version
+			}
+		}
+		if !alt.MatchesVersion(version) {
+			continue
+		}
+
+		// If a package with this name is in current transaction, it replaces installed one.
+		if candidateByName != nil {
+			if candidate, exists := candidateByName[alt.Name]; exists {
+				if alt.MatchesVersion(candidate.info.Version) {
+					return candidate.info.Name, true
+				}
+				continue
+			}
+		}
+		return alt.Name, true
+	}
+
+	return "", false
+}
+
+func formatRequirement(req deps.Requirement) string {
+	if strings.TrimSpace(req.Raw) != "" {
+		return strings.TrimSpace(req.Raw)
+	}
+	parts := make([]string, 0, len(req.Alternatives))
+	for _, alt := range req.Alternatives {
+		if alt.Op == deps.OpAny {
+			parts = append(parts, alt.Name)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s%s%s", alt.Name, formatOp(alt.Op), alt.Version))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func formatOp(op deps.VersionOp) string {
+	switch op {
+	case deps.OpEqual:
+		return "="
+	case deps.OpGreater:
+		return ">"
+	case deps.OpGreaterOrEqual:
+		return ">="
+	case deps.OpLess:
+		return "<"
+	case deps.OpLessOrEqual:
+		return "<="
+	default:
+		return ""
+	}
+}
+
+type stringMinHeap []string
+
+func (h stringMinHeap) Len() int           { return len(h) }
+func (h stringMinHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h stringMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *stringMinHeap) Push(x interface{}) {
+	*h = append(*h, x.(string))
+}
+func (h *stringMinHeap) Pop() interface{} {
+	old := *h
+	last := len(old) - 1
+	item := old[last]
+	*h = old[:last]
+	return item
 }
 
 func sanitizePackagePath(path string) (string, error) {

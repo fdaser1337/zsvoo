@@ -21,6 +21,7 @@ func TestResolveSourceHTTPFallbackToGzip(t *testing.T) {
 
 	sources := strings.TrimSpace(`
 Package: neofetch
+Binary: neofetch
 Version: 7.1.0-4
 Directory: pool/main/n/neofetch
 Checksums-Sha256:
@@ -72,6 +73,48 @@ Checksums-Sha256:
 		t.Fatalf("unexpected upstream version: %s", info.UpstreamVersion)
 	}
 	wantURL := "https://mirror.example/debian/pool/main/n/neofetch/neofetch_7.1.0-4.dsc"
+	if info.DSCURL != wantURL {
+		t.Fatalf("unexpected dsc url:\nwant: %s\ngot:  %s", wantURL, info.DSCURL)
+	}
+}
+
+func TestResolveSourceByBinaryName(t *testing.T) {
+	t.Parallel()
+
+	sources := strings.TrimSpace(`
+Package: pkgconf
+Binary: pkgconf, pkg-config
+Version: 2.0.3-1
+Directory: pool/main/p/pkgconf
+Checksums-Sha256:
+ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 1800 pkgconf_2.0.3-1.dsc
+`) + "\n"
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(req.URL.Path, "/Sources") {
+				return httpResponse(req, http.StatusOK, []byte(sources)), nil
+			}
+			return httpResponse(req, http.StatusNotFound, []byte("missing")), nil
+		}),
+	}
+
+	r := NewResolver(
+		WithHTTPClient(client),
+		WithMirrors([]string{"https://mirror.example/debian"}),
+		WithSuites([]string{"stable"}),
+		WithComponents([]string{"main"}),
+	)
+
+	info, err := r.ResolveSource("pkg-config")
+	if err != nil {
+		t.Fatalf("ResolveSource() error = %v", err)
+	}
+
+	if info.SourcePackage != "pkgconf" {
+		t.Fatalf("unexpected source package: %s", info.SourcePackage)
+	}
+	wantURL := "https://mirror.example/debian/pool/main/p/pkgconf/pkgconf_2.0.3-1.dsc"
 	if info.DSCURL != wantURL {
 		t.Fatalf("unexpected dsc url:\nwant: %s\ngot:  %s", wantURL, info.DSCURL)
 	}

@@ -144,6 +144,7 @@ type sourceRecord struct {
 	Directory string
 	DSCName   string
 	DSCSHA256 string
+	Binaries  []string
 }
 
 func (r *Resolver) findPackageInIndex(mirror, suite, component, pkg string) (*sourceRecord, error) {
@@ -203,7 +204,7 @@ func (r *Resolver) findInSingleIndex(indexURL string, decoder func(io.Reader) (i
 		if err != nil {
 			return nil, false, nil
 		}
-		if rec.Package == pkg {
+		if rec.Package == pkg || containsSourceBinary(rec.Binaries, pkg) {
 			return &rec, true, nil
 		}
 		return nil, false, nil
@@ -294,7 +295,39 @@ func parseSourcesParagraph(lines []string) (sourceRecord, error) {
 		Directory: dir,
 		DSCName:   dscName,
 		DSCSHA256: dscHash,
+		Binaries:  parseCommaSeparatedField(fields["Binary"]),
 	}, nil
+}
+
+func parseCommaSeparatedField(raw string) []string {
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(strings.ToLower(part))
+		if part == "" {
+			continue
+		}
+		if _, exists := seen[part]; exists {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return out
+}
+
+func containsSourceBinary(names []string, wanted string) bool {
+	wanted = strings.TrimSpace(strings.ToLower(wanted))
+	if wanted == "" {
+		return false
+	}
+	for _, name := range names {
+		if strings.TrimSpace(strings.ToLower(name)) == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func parseChecksumsForDSC(raw string) (string, string) {

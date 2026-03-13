@@ -9,8 +9,10 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "zsvo",
-	Short: "A simple source-based package manager",
+	Use:           "zsvo",
+	Short:         "A simple source-based package manager",
+	SilenceErrors: true,
+	SilenceUsage:  true,
 	Long: `A minimal package manager for custom Linux distributions based on LFS
 
 Available commands:

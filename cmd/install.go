@@ -3,8 +3,12 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"zsvo/pkg/builder"
@@ -28,13 +32,14 @@ var InstallCmd = &cobra.Command{
 			workDir = "/tmp/pkg-work"
 		}
 		autoSource, _ := cmd.Flags().GetBool("auto-source")
+		autoBuildDeps, _ := cmd.Flags().GetBool("auto-build-deps")
 
 		installTargets := make([]string, 0, len(args))
-		var resolver *debian.Resolver
-		var b *builder.Builder
+		i := installer.NewInstaller(rootDir)
+
+		var session *autoBuildSession
 		if autoSource {
-			resolver = debian.NewResolver()
-			b = builder.NewBuilder(workDir)
+			session = newAutoBuildSession(workDir, autoBuildDeps)
 		}
 
 		for _, target := range args {
@@ -55,24 +60,12 @@ var InstallCmd = &cobra.Command{
 				)
 			}
 
-			fmt.Printf("Resolving Debian source for %s...\n", target)
-			srcInfo, err := resolver.ResolveSource(target)
+			builtPackage, err := session.buildPackage(target, false, nil)
 			if err != nil {
 				return err
 			}
-
-			rcp := autoRecipeFromDebian(srcInfo)
-			fmt.Printf("Building %s from %s...\n", rcp.GetPackageName(), srcInfo.DSCURL)
-			if err := b.Build(rcp); err != nil {
-				return fmt.Errorf("failed to auto-build %s: %w", target, err)
-			}
-
-			builtPackage := filepath.Join(rcp.GetPackageDir(workDir), rcp.GetPackageFileName())
-			fmt.Printf("Built package: %s\n", builtPackage)
 			installTargets = append(installTargets, builtPackage)
 		}
-
-		i := installer.NewInstaller(rootDir)
 
 		if len(installTargets) == 1 {
 			fmt.Printf("Installing package from %s...\n", installTargets[0])
@@ -92,6 +85,7 @@ func init() {
 	InstallCmd.Flags().StringP("root", "r", "/", "Root directory for installation")
 	InstallCmd.Flags().StringP("work-dir", "w", "/tmp/pkg-work", "Working directory for source builds")
 	InstallCmd.Flags().Bool("auto-source", true, "Auto-build package names from Debian source")
+	InstallCmd.Flags().Bool("auto-build-deps", true, "Auto-build missing source build dependencies through zsvo")
 }
 
 func isInstallFileTarget(target string) (bool, error) {
@@ -130,6 +124,375 @@ func looksLikeFilePath(target string) bool {
 		strings.HasSuffix(target, ".zov")
 }
 
+const maxAutoBuildDepth = 16
+
+type autoBuildSession struct {
+	workDir          string
+	toolRoot         string
+	autoBuildDeps    bool
+	resolver         *debian.Resolver
+	builder          *builder.Builder
+	toolInstaller    *installer.Installer
+	builtPackages    map[string]string
+	toolDepsReady    map[string]struct{}
+	buildingPackages map[string]struct{}
+}
+
+func newAutoBuildSession(workDir string, autoBuildDeps bool) *autoBuildSession {
+	b := builder.NewBuilder(workDir)
+	b.SetQuiet(true)
+
+	s := &autoBuildSession{
+		workDir:          workDir,
+		toolRoot:         filepath.Join(workDir, "bootstrap-root"),
+		autoBuildDeps:    autoBuildDeps,
+		resolver:         debian.NewResolver(),
+		builder:          b,
+		toolInstaller:    installer.NewInstaller(filepath.Join(workDir, "bootstrap-root")),
+		builtPackages:    make(map[string]string),
+		toolDepsReady:    make(map[string]struct{}),
+		buildingPackages: make(map[string]struct{}),
+	}
+	s.refreshBuildEnv()
+	return s
+}
+
+func (s *autoBuildSession) refreshBuildEnv() {
+	basePath := splitPathList(os.Getenv("PATH"))
+	binPrefixes := []string{
+		filepath.Join(s.toolRoot, "usr", "bin"),
+		filepath.Join(s.toolRoot, "bin"),
+		filepath.Join(s.toolRoot, "usr", "sbin"),
+		filepath.Join(s.toolRoot, "sbin"),
+	}
+	mergedPath := joinPathListUnique(append(binPrefixes, basePath...))
+	s.builder.SetEnvOverride("PATH", mergedPath)
+
+	pkgConfigPath := splitPathList(os.Getenv("PKG_CONFIG_PATH"))
+	pkgConfigPrefixes := []string{
+		filepath.Join(s.toolRoot, "usr", "lib", "pkgconfig"),
+		filepath.Join(s.toolRoot, "usr", "lib64", "pkgconfig"),
+		filepath.Join(s.toolRoot, "usr", "share", "pkgconfig"),
+		filepath.Join(s.toolRoot, "lib", "pkgconfig"),
+		filepath.Join(s.toolRoot, "lib64", "pkgconfig"),
+	}
+	s.builder.SetEnvOverride("PKG_CONFIG_PATH", joinPathListUnique(append(pkgConfigPrefixes, pkgConfigPath...)))
+	cmakePrefixes := []string{
+		filepath.Join(s.toolRoot, "usr"),
+		filepath.Join(s.toolRoot),
+	}
+	cmakePrefixes = append(cmakePrefixes, splitPathList(os.Getenv("CMAKE_PREFIX_PATH"))...)
+	s.builder.SetEnvOverride("CMAKE_PREFIX_PATH", joinPathListUnique(cmakePrefixes))
+}
+
+func (s *autoBuildSession) buildPackage(requestName string, asBuildDep bool, stack []string) (string, error) {
+	requestName = normalizePackageName(requestName)
+	if requestName == "" {
+		return "", fmt.Errorf("invalid package name")
+	}
+
+	if len(stack) >= maxAutoBuildDepth {
+		return "", fmt.Errorf("dependency chain is too deep while building %s: %s", requestName, strings.Join(append(stack, requestName), " -> "))
+	}
+	if _, exists := s.buildingPackages[requestName]; exists {
+		return "", fmt.Errorf("dependency cycle detected: %s", strings.Join(append(stack, requestName), " -> "))
+	}
+
+	if builtPath, ok := s.builtPackages[requestName]; ok {
+		if asBuildDep {
+			if err := s.installBuildDependency(requestName, builtPath); err != nil {
+				return "", err
+			}
+		}
+		return builtPath, nil
+	}
+
+	s.buildingPackages[requestName] = struct{}{}
+	defer delete(s.buildingPackages, requestName)
+
+	fmt.Printf("Resolving Debian source for %s...\n", requestName)
+	srcInfo, err := s.resolver.ResolveSource(requestName)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve source for %s: %w", requestName, err)
+	}
+
+	rcp := autoRecipeFromDebian(srcInfo)
+	normalizedRecipeName := normalizePackageName(rcp.Name)
+	if normalizedRecipeName != "" && normalizedRecipeName != requestName {
+		// Alias the resolved source package name to the requested name.
+		if _, exists := s.buildingPackages[normalizedRecipeName]; exists {
+			return "", fmt.Errorf("dependency cycle detected: %s", strings.Join(append(stack, requestName, normalizedRecipeName), " -> "))
+		}
+	}
+
+	fmt.Printf("Building %s from %s...\n", rcp.GetPackageName(), srcInfo.DSCURL)
+	var buildErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		bar := newProgressUI(rcp.Name)
+		s.builder.SetProgressCallback(func(p builder.BuildProgress) {
+			bar.update(p.Step, p.Total, fmt.Sprintf("%s: %s", rcp.Name, p.Message))
+		})
+
+		buildErr = s.builder.Build(rcp)
+		s.builder.SetProgressCallback(nil)
+		if buildErr == nil {
+			bar.finish(true, fmt.Sprintf("%s: complete", rcp.Name))
+			break
+		}
+		bar.finish(false, fmt.Sprintf("%s: failed", rcp.Name))
+
+		if !s.autoBuildDeps || attempt == 1 {
+			hint := buildFailureHint(requestName, buildErr)
+			if hint != "" {
+				return "", fmt.Errorf("failed to auto-build %s: %w\n%s", requestName, buildErr, hint)
+			}
+			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
+		}
+
+		missingDeps := inferMissingBuildDeps(buildErr)
+		if len(missingDeps) == 0 {
+			hint := buildFailureHint(requestName, buildErr)
+			if hint != "" {
+				return "", fmt.Errorf("failed to auto-build %s: %w\n%s", requestName, buildErr, hint)
+			}
+			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
+		}
+
+		fmt.Printf("Detected missing build dependencies for %s: %s\n", requestName, strings.Join(missingDeps, ", "))
+		for _, dep := range missingDeps {
+			if dep == requestName || dep == normalizedRecipeName {
+				continue
+			}
+			if _, ready := s.toolDepsReady[dep]; ready {
+				continue
+			}
+			if err := s.ensureBuildDependency(dep, append(stack, requestName)); err != nil {
+				return "", fmt.Errorf("failed to satisfy build dependency %s for %s: %w", dep, requestName, err)
+			}
+		}
+
+		fmt.Printf("Retrying build for %s after auto-installing dependencies...\n", requestName)
+	}
+
+	if buildErr != nil {
+		return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
+	}
+
+	builtPackage := filepath.Join(rcp.GetPackageDir(s.workDir), rcp.GetPackageFileName())
+	fmt.Printf("Built package: %s\n", builtPackage)
+
+	s.builtPackages[requestName] = builtPackage
+	if normalizedRecipeName != "" {
+		s.builtPackages[normalizedRecipeName] = builtPackage
+	}
+
+	if asBuildDep {
+		if err := s.installBuildDependency(requestName, builtPackage); err != nil {
+			return "", err
+		}
+	}
+
+	return builtPackage, nil
+}
+
+func (s *autoBuildSession) ensureBuildDependency(dep string, stack []string) error {
+	dep = normalizePackageName(dep)
+	if dep == "" {
+		return fmt.Errorf("invalid build dependency name")
+	}
+
+	if _, ready := s.toolDepsReady[dep]; ready {
+		return nil
+	}
+	if toolAlreadyAvailable(dep) {
+		s.toolDepsReady[dep] = struct{}{}
+		return nil
+	}
+
+	packagePath, err := s.buildPackage(dep, true, stack)
+	if err != nil {
+		return err
+	}
+
+	return s.installBuildDependency(dep, packagePath)
+}
+
+func (s *autoBuildSession) installBuildDependency(dep, packagePath string) error {
+	dep = normalizePackageName(dep)
+	if dep == "" {
+		return fmt.Errorf("invalid build dependency name")
+	}
+	if _, ready := s.toolDepsReady[dep]; ready {
+		return nil
+	}
+
+	fmt.Printf("Installing build dependency %s into %s...\n", dep, s.toolRoot)
+	if err := s.toolInstaller.Install(packagePath); err != nil {
+		return fmt.Errorf("failed to install build dependency %s: %w", dep, err)
+	}
+	s.toolDepsReady[dep] = struct{}{}
+	s.refreshBuildEnv()
+	return nil
+}
+
+func splitPathList(value string) []string {
+	parts := strings.Split(value, string(os.PathListSeparator))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func joinPathListUnique(parts []string) string {
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, exists := seen[part]; exists {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return strings.Join(out, string(os.PathListSeparator))
+}
+
+var simplePkgNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
+var missingCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)(?:^|[\s:])(?:/bin/)?sh:\s*(?:\d+:\s*)?([a-zA-Z0-9+_.-]+):\s*(?:command not found|not found)\b`),
+	regexp.MustCompile(`(?m)\b([a-zA-Z0-9+_.-]+):\s*command not found\b`),
+	regexp.MustCompile(`(?m)\b([a-zA-Z0-9+_.-]+):\s*not found\b`),
+}
+
+func inferMissingBuildDeps(err error) []string {
+	if err == nil {
+		return nil
+	}
+
+	text := err.Error()
+	lowerText := strings.ToLower(text)
+	found := make(map[string]struct{})
+
+	for _, pattern := range missingCommandPatterns {
+		matches := pattern.FindAllStringSubmatch(text, -1)
+		for _, match := range matches {
+			if len(match) < 2 {
+				continue
+			}
+			pkg := mapToolToSourcePackage(match[1])
+			if pkg == "" {
+				continue
+			}
+			found[pkg] = struct{}{}
+		}
+	}
+
+	if strings.Contains(lowerText, "failed to find a lua 5.1-compatible interpreter") {
+		found["lua5.1"] = struct{}{}
+	}
+	if strings.Contains(lowerText, "pkg-config") &&
+		(strings.Contains(lowerText, "not found") || strings.Contains(lowerText, "could not find")) {
+		found["pkgconf"] = struct{}{}
+	}
+	if strings.Contains(lowerText, "no acceptable c compiler found in $path") ||
+		strings.Contains(lowerText, "c compiler cannot create executables") {
+		found["gcc"] = struct{}{}
+	}
+
+	if len(found) == 0 {
+		return nil
+	}
+
+	deps := make([]string, 0, len(found))
+	for dep := range found {
+		deps = append(deps, dep)
+	}
+	sort.Strings(deps)
+	return deps
+}
+
+func mapToolToSourcePackage(tool string) string {
+	tool = normalizePackageName(tool)
+	if tool == "" || allDigits(tool) {
+		return ""
+	}
+	switch tool {
+	case "sh", "bash", "dash", "zsh":
+		return ""
+	case "pkg-config":
+		return "pkgconf"
+	case "ninja":
+		return "ninja-build"
+	case "python":
+		return "python3"
+	case "lua":
+		return "lua5.1"
+	case "luajit":
+		return "luajit"
+	case "cc", "c++", "g++", "gcc":
+		return "gcc"
+	case "ld":
+		return "binutils"
+	case "xzcat":
+		return "xz-utils"
+	}
+
+	if !simplePkgNamePattern.MatchString(tool) {
+		return ""
+	}
+	return tool
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizePackageName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+var commandHintsByDep = map[string][]string{
+	"pkgconf":     {"pkg-config"},
+	"ninja-build": {"ninja"},
+	"python3":     {"python3", "python"},
+	"lua5.1":      {"lua", "lua5.1"},
+}
+
+func toolAlreadyAvailable(dep string) bool {
+	dep = normalizePackageName(dep)
+	if dep == "" {
+		return false
+	}
+
+	commands := commandHintsByDep[dep]
+	if len(commands) == 0 {
+		commands = []string{dep}
+	}
+
+	for _, name := range commands {
+		if _, err := exec.LookPath(name); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 	name := src.SourcePackage
 	if name == "" {
@@ -142,8 +505,8 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 
 	installCmd := fmt.Sprintf(
 		"if [ -f build/cmake_install.cmake ]; then DESTDIR={{pkgdir}} cmake --install build; "+
-			"elif [ -f build/meson-private/coredata.dat ]; then DESTDIR={{pkgdir}} meson install -C build; "+
-			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make DESTDIR={{pkgdir}} PREFIX=/usr install; "+
+			"elif [ -f build/meson-private/coredata.dat ]; then DESTDIR={{pkgdir}} meson install -C build ${ZSVO_MESON_INSTALL_ARGS}; "+
+			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make DESTDIR={{pkgdir}} PREFIX=/usr ${ZSVO_MAKE_INSTALL_FLAGS} install; "+
 			"elif [ -f %s ]; then install -Dm755 %s {{pkgdir}}/usr/bin/%s; fi",
 		name,
 		name,
@@ -159,11 +522,209 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 			Sha256:    src.DSCSHA256,
 		},
 		Build: []string{
-			"[ -f configure ] && ./configure --prefix=/usr || true",
-			"if [ -f CMakeLists.txt ]; then cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build -j${jobs}; " +
-				"elif [ -f meson.build ]; then meson setup build --prefix=/usr && meson compile -C build -j${jobs}; " +
-				"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make -j${jobs}; fi",
+			"if [ ! -f configure ] && [ -f autogen.sh ]; then sh ./autogen.sh --no-check ${ZSVO_AUTOGEN_ARGS}; fi; if [ -f configure ]; then ./configure --prefix=/usr ${ZSVO_CONFIGURE_FLAGS}; fi",
+			"if [ -f CMakeLists.txt ]; then cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ${ZSVO_CMAKE_FLAGS} && cmake --build build -j${jobs} -- ${ZSVO_CMAKE_BUILD_FLAGS}; " +
+				"elif [ -f meson.build ]; then meson setup build --prefix=/usr ${ZSVO_MESON_SETUP_ARGS} && meson compile -C build -j${jobs} ${ZSVO_MESON_COMPILE_ARGS}; " +
+				"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make -j${jobs} ${ZSVO_MAKE_FLAGS}; fi",
 		},
 		Install: []string{installCmd},
 	}
+}
+
+type progressUI struct {
+	total       int
+	pkgName     string
+	startedAt   time.Time
+	enabled     bool
+	frameIdx    int
+	lastLineLen int
+}
+
+func newProgressUI(pkgName string) *progressUI {
+	return &progressUI{
+		pkgName:   pkgName,
+		startedAt: time.Now(),
+		enabled:   supportsANSIAndTTY(),
+	}
+}
+
+func (p *progressUI) update(step, total int, message string) {
+	if total <= 0 {
+		total = 1
+	}
+	if step < 0 {
+		step = 0
+	}
+	if step > total {
+		step = total
+	}
+	p.total = total
+
+	if !p.enabled {
+		fmt.Printf("[%d/%d] %s\n", step, total, message)
+		return
+	}
+
+	const width = 32
+	filled := step * width / total
+	if filled > width {
+		filled = width
+	}
+
+	percent := step * 100 / total
+	spinner := progressFrames[p.frameIdx%len(progressFrames)]
+	p.frameIdx++
+
+	bar := renderColoredBar(width, filled)
+	elapsed := formatElapsed(time.Since(p.startedAt))
+
+	line := fmt.Sprintf(
+		"\r%s %s %s %3d%% %s %s",
+		colorize("36;1", spinner),
+		colorize("1", p.pkgName),
+		bar,
+		percent,
+		colorize("2", "| "+truncateText(message, 48)),
+		colorize("2", elapsed),
+	)
+
+	if pad := p.lastLineLen - visibleLen(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	p.lastLineLen = visibleLen(line)
+	fmt.Print(line)
+}
+
+func (p *progressUI) finish(ok bool, message string) {
+	total := p.total
+	if total <= 0 {
+		total = 1
+	}
+	p.update(total, total, message)
+
+	if p.enabled {
+		status := colorize("31;1", "FAIL")
+		if ok {
+			status = colorize("32;1", "DONE")
+		}
+		fmt.Printf("  %s  %s\n", status, colorize("2", "("+formatElapsed(time.Since(p.startedAt))+")"))
+		return
+	}
+
+	fmt.Println()
+}
+
+var progressFrames = []string{"|", "/", "-", "\\"}
+
+func renderColoredBar(width, filled int) string {
+	if width <= 0 {
+		return "[]"
+	}
+
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+
+	done := strings.Repeat("=", filled)
+	todo := strings.Repeat(".", width-filled)
+	return "[" + colorize("32", done) + colorize("2", todo) + "]"
+}
+
+func supportsANSIAndTTY() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	term := strings.TrimSpace(strings.ToLower(os.Getenv("TERM")))
+	if term == "" || term == "dumb" {
+		return false
+	}
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func colorize(code, text string) string {
+	if text == "" {
+		return ""
+	}
+	return "\x1b[" + code + "m" + text + "\x1b[0m"
+}
+
+func formatElapsed(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	totalSeconds := int(d.Seconds())
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
+}
+
+func truncateText(s string, max int) string {
+	if max <= 3 || len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
+}
+
+func visibleLen(s string) int {
+	// This is enough here because we only inject ANSI codes ourselves.
+	n := 0
+	inEsc := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inEsc {
+			if ch == 'm' {
+				inEsc = false
+			}
+			continue
+		}
+		if ch == 0x1b {
+			inEsc = true
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+func buildFailureHint(pkgName string, err error) string {
+	if err == nil {
+		return ""
+	}
+
+	text := strings.ToLower(err.Error())
+	pkgName = strings.TrimSpace(strings.ToLower(pkgName))
+	hints := make([]string, 0, 4)
+
+	missingDeps := inferMissingBuildDeps(err)
+	if len(missingDeps) > 0 {
+		hints = append(
+			hints,
+			fmt.Sprintf("Hint: missing build dependencies detected: %s.", strings.Join(missingDeps, ", ")),
+			"Hint: добавь рецепты для этих пакетов (или алиасы к Debian source), затем повтори `zsvo install`.",
+		)
+	}
+	if strings.Contains(text, "on systems using dpkg and apt, try: \"apt-get install package\"") {
+		hints = append(hints,
+			"Hint: upstream configure-script ожидает системные build-зависимости; в zsvo это нужно решать рецептами/автосборкой зависимостей.",
+		)
+	}
+
+	if pkgName == "neovim" && strings.Contains(text, "lua") {
+		hints = append(hints,
+			"Hint (neovim): после установки Lua можно зафиксировать интерпретатор: `export ZSVO_CMAKE_FLAGS=\"-DLUA_PRG=$(which lua) -DLUA_GEN_PRG=$(which lua)\"`.",
+		)
+	}
+
+	if len(hints) == 0 {
+		return ""
+	}
+
+	return strings.Join(hints, "\n")
 }

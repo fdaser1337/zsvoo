@@ -56,6 +56,8 @@ install:
 deps:
   - glibc
   - readline
+  - "zlib>=1.2.13"
+  - "lua5.1 | luajit"
 ```
 
 Debian upstream source mode:
@@ -71,10 +73,14 @@ source:
 ```
 
 Notes:
-- `deps` are simple package names (no version solver yet).
+- `deps` support full constraints: `name`, `name>=1.2`, `name (<= 2.0)`, and alternatives via `|`.
+- Installer resolves dependencies with version checks and transaction ordering (topological sort), including mixed installed + transaction packages.
 - `{{pkgdir}}` (and `${pkgdir}`) points to staging DESTDIR.
 - If `source.debian_dsc` (or `.dsc` URL) is used, zsvo downloads only `*.orig*.tar.*` archives from that source package and ignores Debian patch archives (`debian.tar.*` / `diff.gz`).
 - `zsvo install <name>` auto-resolves Debian source over HTTP from Debian `Sources` indexes, builds package in `--work-dir` and installs it.
+- Auto-build in `install <name>` is quiet by default and shows a colored live progress bar (spinner + percent + elapsed time) instead of raw compiler output; full command output tail is shown on failure.
+- If build fails due to missing tools (`cmake`, `meson`, `pkg-config`, `lua` etc.), `zsvo install` auto-detects them, builds missing dependencies from Debian source with zsvo itself, installs them into `--work-dir/bootstrap-root`, and retries the build (`--auto-build-deps=false` to disable).
+- Auto-build can be tuned with env flags: `ZSVO_AUTOGEN_ARGS`, `ZSVO_CONFIGURE_FLAGS`, `ZSVO_CMAKE_FLAGS`, `ZSVO_CMAKE_BUILD_FLAGS`, `ZSVO_MESON_SETUP_ARGS`, `ZSVO_MESON_COMPILE_ARGS`, `ZSVO_MESON_INSTALL_ARGS`, `ZSVO_MAKE_FLAGS`, `ZSVO_MAKE_INSTALL_FLAGS`.
 - Package metadata is stored in `.zsvo.yml` (not `.PKGINFO`).
 
 ## Architecture

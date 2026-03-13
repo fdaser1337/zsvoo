@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"zsvo/pkg/deps"
 )
 
 // Recipe represents a package recipe.
@@ -200,8 +202,8 @@ func ParseRecipeFromReader(r io.Reader) (*Recipe, error) {
 		if dep == "" {
 			return nil, fmt.Errorf("recipe deps cannot contain empty values")
 		}
-		if strings.ContainsAny(dep, "|<>= \t\n\r") {
-			return nil, fmt.Errorf("unsupported dependency format %q: use plain package names", dep)
+		if _, err := deps.ParseRequirement(dep); err != nil {
+			return nil, fmt.Errorf("invalid recipe dependency %q: %w", dep, err)
 		}
 	}
 

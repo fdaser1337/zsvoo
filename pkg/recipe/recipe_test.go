@@ -42,7 +42,7 @@ deps:
 	}
 }
 
-func TestParseRecipeRejectsComplexDependencySyntax(t *testing.T) {
+func TestParseRecipeAcceptsComplexDependencySyntax(t *testing.T) {
 	t.Parallel()
 
 	input := `
@@ -57,11 +57,15 @@ install:
   - make DESTDIR={{pkgdir}} install
 deps:
   - glibc>=2.39
+  - liblua5.1-0 | libluajit-5.1-2
 `
 
-	_, err := ParseRecipeFromReader(strings.NewReader(input))
-	if err == nil {
-		t.Fatalf("expected parse error for unsupported dependency syntax")
+	r, err := ParseRecipeFromReader(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("expected complex dependencies to parse, got error: %v", err)
+	}
+	if len(r.Deps) != 2 {
+		t.Fatalf("expected 2 deps, got %d", len(r.Deps))
 	}
 }
 

@@ -15,7 +15,17 @@ import (
 
 // Builder handles building packages from recipes
 type Builder struct {
-	workDir string
+	workDir          string
+	quiet            bool
+	progressCallback func(BuildProgress)
+	envOverrides     map[string]string
+}
+
+// BuildProgress represents build progress state.
+type BuildProgress struct {
+	Step    int
+	Total   int
+	Message string
 }
 
 // NewBuilder creates a new builder
@@ -31,36 +41,51 @@ func (b *Builder) Build(recipe *recipe.Recipe) error {
 		return fmt.Errorf("recipe cannot be nil")
 	}
 
+	totalSteps := 4 + len(recipe.Build) + len(recipe.Install)
+	step := 0
+	nextStep := func(message string) {
+		step++
+		b.reportProgress(step, totalSteps, message)
+	}
+
 	// Create working directories
 	sourceDir := recipe.GetSourceDir(b.workDir)
 	stagingDir := recipe.GetStagingDir(b.workDir)
 	packageDir := recipe.GetPackageDir(b.workDir)
 
+	nextStep("Preparing directories")
 	if err := b.prepareDirectories(sourceDir, stagingDir, packageDir); err != nil {
 		return fmt.Errorf("failed to prepare directories: %w", err)
 	}
 
 	// Download and extract source
+	nextStep("Downloading and extracting source")
 	if err := b.downloadAndExtract(recipe); err != nil {
 		return fmt.Errorf("failed to download and extract source: %w", err)
 	}
 
 	// Apply patches
+	nextStep("Applying recipe patches")
 	if err := b.applyPatches(recipe, sourceDir); err != nil {
 		return fmt.Errorf("failed to apply patches: %w", err)
 	}
 
 	// Build package
-	if err := b.executeBuild(recipe, sourceDir, stagingDir); err != nil {
+	if err := b.executeBuild(recipe, sourceDir, stagingDir, func(i, total int) {
+		nextStep(fmt.Sprintf("Build step %d/%d", i, total))
+	}); err != nil {
 		return fmt.Errorf("failed to build package: %w", err)
 	}
 
 	// Package files
-	if err := b.packageFiles(recipe, sourceDir, stagingDir); err != nil {
+	if err := b.packageFiles(recipe, sourceDir, stagingDir, func(i, total int) {
+		nextStep(fmt.Sprintf("Install step %d/%d", i, total))
+	}); err != nil {
 		return fmt.Errorf("failed to package files: %w", err)
 	}
 
 	// Create package archive
+	nextStep("Creating package archive")
 	p := packager.NewPackager(b.workDir)
 	if err := p.Package(recipe); err != nil {
 		return fmt.Errorf("failed to create package archive: %w", err)
@@ -133,7 +158,7 @@ func (b *Builder) applyPatches(recipe *recipe.Recipe, sourceDir string) error {
 }
 
 // executeBuild executes build commands
-func (b *Builder) executeBuild(recipe *recipe.Recipe, sourceDir, stagingDir string) error {
+func (b *Builder) executeBuild(recipe *recipe.Recipe, sourceDir, stagingDir string, progressFn func(step, total int)) error {
 	// Find the source directory (usually the first subdirectory)
 	srcPath, err := b.findSourceDirectory(sourceDir)
 	if err != nil {
@@ -145,6 +170,10 @@ func (b *Builder) executeBuild(recipe *recipe.Recipe, sourceDir, stagingDir stri
 
 	// Execute build commands
 	for i, cmd := range recipe.Build {
+		if progressFn != nil {
+			progressFn(i+1, len(recipe.Build))
+		}
+
 		// Substitute variables in command
 		cmd = b.substituteVariables(cmd, sourceDir, stagingDir)
 
@@ -192,7 +221,7 @@ func (b *Builder) buildEnvironment(stagingDir string) []string {
 	// Add parallel build variable
 	env = append(env, fmt.Sprintf("MAKEFLAGS=-j%d", runtime.NumCPU()))
 
-	return env
+	return applyEnvOverrides(env, b.envOverrides)
 }
 
 // executeCommand executes a single command
@@ -204,6 +233,19 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = workDir
 	cmd.Env = env
+
+	if b.quiet {
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			details := tailOutput(string(output), 20)
+			if details != "" {
+				return fmt.Errorf("%w\n%s", err, details)
+			}
+			return err
+		}
+		return nil
+	}
+
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -308,6 +350,53 @@ func (b *Builder) SetWorkDir(workDir string) {
 	b.workDir = workDir
 }
 
+// SetQuiet enables or disables command output streaming.
+func (b *Builder) SetQuiet(quiet bool) {
+	b.quiet = quiet
+}
+
+// SetProgressCallback sets callback for build progress updates.
+func (b *Builder) SetProgressCallback(callback func(BuildProgress)) {
+	b.progressCallback = callback
+}
+
+// SetEnvOverride sets or removes one environment override used for build commands.
+func (b *Builder) SetEnvOverride(key, value string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	if b.envOverrides == nil {
+		b.envOverrides = make(map[string]string)
+	}
+	if value == "" {
+		delete(b.envOverrides, key)
+		return
+	}
+	b.envOverrides[key] = value
+}
+
+// SetEnvOverrides replaces all environment overrides used for build commands.
+func (b *Builder) SetEnvOverrides(overrides map[string]string) {
+	if len(overrides) == 0 {
+		b.envOverrides = nil
+		return
+	}
+	cloned := make(map[string]string, len(overrides))
+	for key, value := range overrides {
+		key = strings.TrimSpace(key)
+		if key == "" || value == "" {
+			continue
+		}
+		cloned[key] = value
+	}
+	if len(cloned) == 0 {
+		b.envOverrides = nil
+		return
+	}
+	b.envOverrides = cloned
+}
+
 // substituteVariables substitutes variables in command strings
 func (b *Builder) substituteVariables(cmdStr, sourceDir, stagingDir string) string {
 	// Get number of CPU cores
@@ -325,7 +414,7 @@ func (b *Builder) substituteVariables(cmdStr, sourceDir, stagingDir string) stri
 }
 
 // packageFiles runs the package commands
-func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir string) error {
+func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir string, progressFn func(step, total int)) error {
 	// Find the source directory (usually the first subdirectory)
 	srcPath, err := b.findSourceDirectory(sourceDir)
 	if err != nil {
@@ -337,6 +426,10 @@ func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir stri
 
 	// Execute package commands
 	for i, cmd := range recipe.Install {
+		if progressFn != nil {
+			progressFn(i+1, len(recipe.Install))
+		}
+
 		// Substitute variables in command
 		cmd = b.substituteVariables(cmd, sourceDir, stagingDir)
 
@@ -346,4 +439,54 @@ func (b *Builder) packageFiles(recipe *recipe.Recipe, sourceDir, stagingDir stri
 	}
 
 	return nil
+}
+
+func (b *Builder) reportProgress(step, total int, message string) {
+	if b.progressCallback == nil {
+		return
+	}
+	b.progressCallback(BuildProgress{
+		Step:    step,
+		Total:   total,
+		Message: message,
+	})
+}
+
+func tailOutput(output string, maxLines int) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+
+	lines := strings.Split(output, "\n")
+	if maxLines <= 0 || len(lines) <= maxLines {
+		return output
+	}
+	return strings.Join(lines[len(lines)-maxLines:], "\n")
+}
+
+func applyEnvOverrides(base []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+
+	out := append([]string(nil), base...)
+	indexByKey := make(map[string]int, len(out))
+	for i, entry := range out {
+		if eq := strings.IndexByte(entry, '='); eq > 0 {
+			indexByKey[entry[:eq]] = i
+		}
+	}
+
+	for key, value := range overrides {
+		item := key + "=" + value
+		if idx, ok := indexByKey[key]; ok {
+			out[idx] = item
+			continue
+		}
+		indexByKey[key] = len(out)
+		out = append(out, item)
+	}
+
+	return out
 }
