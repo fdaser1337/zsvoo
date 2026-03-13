@@ -47,3 +47,14 @@ yay/
 *.bak
 *.backup
 *.orig
+
+# Docker and deployment scripts
+zsvo-docker.sh
+*.sh
+deploy/
+docker-compose.yml
+
+# Work directories
+/tmp/pkg-work/
+/tmp/zsvo-cache/
+*.pkg.tar.zst
