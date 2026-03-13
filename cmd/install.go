@@ -14,12 +14,14 @@ import (
 	"zsvo/pkg/builder"
 	"zsvo/pkg/debian"
 	"zsvo/pkg/installer"
+	"zsvo/pkg/i18n"
 	"zsvo/pkg/recipe"
+	"zsvo/pkg/ui"
 )
 
 var InstallCmd = &cobra.Command{
 	Use:   "install <package> [package...]",
-	Short: "Install package(s)",
+	Short: i18n.T("install_cmd"),
 	Long:  `Install one or more packages from local files or auto-build from Debian source by package name`,
 	Args:  cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -33,6 +35,18 @@ var InstallCmd = &cobra.Command{
 		}
 		autoSource, _ := cmd.Flags().GetBool("auto-source")
 		autoBuildDeps, _ := cmd.Flags().GetBool("auto-build-deps")
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+
+		if dryRun {
+			status := ui.NewStatusBar("", 1)
+			status.SetTheme("neon")
+			status.PrintHeader("DRY RUN MODE")
+			status.PrintInfo(fmt.Sprintf("Root directory: %s", rootDir))
+			status.PrintInfo(fmt.Sprintf("Work directory: %s", workDir))
+			status.PrintInfo(fmt.Sprintf("Auto-source: %t", autoSource))
+			status.PrintInfo(fmt.Sprintf("Auto-build-deps: %t", autoBuildDeps))
+			status.PrintFooter()
+		}
 
 		installTargets := make([]string, 0, len(args))
 		i := installer.NewInstaller(rootDir)
@@ -49,6 +63,11 @@ var InstallCmd = &cobra.Command{
 			}
 
 			if isFile {
+				if dryRun {
+					status := ui.NewStatusBar("", 1)
+					status.SetTheme("neon")
+					status.PrintInfo(fmt.Sprintf(i18n.T("Would install package from file: %s"), target))
+				}
 				installTargets = append(installTargets, target)
 				continue
 			}
@@ -60,6 +79,14 @@ var InstallCmd = &cobra.Command{
 				)
 			}
 
+			if dryRun {
+				status := ui.NewStatusBar("", 1)
+				status.SetTheme("neon")
+				status.PrintInfo(fmt.Sprintf(i18n.T("Would auto-build package: %s"), target))
+				installTargets = append(installTargets, target) // для демонстрации
+				continue
+			}
+
 			builtPackage, err := session.buildPackage(target, false, nil)
 			if err != nil {
 				return err
@@ -68,15 +95,37 @@ var InstallCmd = &cobra.Command{
 		}
 
 		if len(installTargets) == 1 {
-			fmt.Printf("Installing package from %s...\n", installTargets[0])
+			if dryRun {
+				status := ui.NewStatusBar("", 1)
+				status.SetTheme("neon")
+				status.PrintInfo(i18n.T("Would install 1 package"))
+			} else {
+				fmt.Printf(i18n.T("Installing package from %s...")+"\n", installTargets[0])
+			}
 		} else {
-			fmt.Printf("Installing %d packages...\n", len(installTargets))
+			if dryRun {
+				status := ui.NewStatusBar("", 1)
+				status.SetTheme("neon")
+				status.PrintInfo(fmt.Sprintf(i18n.T("Would install %d packages"), len(installTargets)))
+			} else {
+				fmt.Printf(i18n.T("Installing %d packages...")+"\n", len(installTargets))
+			}
 		}
+
+		if dryRun {
+			status := ui.NewStatusBar("", 1)
+			status.SetTheme("neon")
+			status.PrintHeader("DRY RUN COMPLETE")
+			status.PrintInfo(i18n.T("No actual changes were made."))
+			status.PrintFooter()
+			return nil
+		}
+
 		if err := i.InstallMany(installTargets); err != nil {
 			return fmt.Errorf("failed to install packages: %w", err)
 		}
 
-		fmt.Printf("Package installation completed successfully\n")
+		fmt.Printf(i18n.T("Package installation completed successfully")+"\n")
 		return nil
 	},
 }
@@ -86,6 +135,7 @@ func init() {
 	InstallCmd.Flags().StringP("work-dir", "w", "/tmp/pkg-work", "Working directory for source builds")
 	InstallCmd.Flags().Bool("auto-source", true, "Auto-build package names from Debian source")
 	InstallCmd.Flags().Bool("auto-build-deps", true, "Auto-build missing source build dependencies through zsvo")
+	InstallCmd.Flags().Bool("dry-run", false, "Show what would be done without executing")
 }
 
 func isInstallFileTarget(target string) (bool, error) {
@@ -531,87 +581,26 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 	}
 }
 
+// progressUI wrapper for compatibility
 type progressUI struct {
-	total       int
-	pkgName     string
-	startedAt   time.Time
-	enabled     bool
-	frameIdx    int
-	lastLineLen int
+	statusBar *ui.StatusBar
 }
 
 func newProgressUI(pkgName string) *progressUI {
+	bar := ui.NewStatusBar(pkgName, 1)
+	bar.SetTheme("neon")
+	bar.SetSpinner("dots")
 	return &progressUI{
-		pkgName:   pkgName,
-		startedAt: time.Now(),
-		enabled:   supportsANSIAndTTY(),
+		statusBar: bar,
 	}
 }
 
 func (p *progressUI) update(step, total int, message string) {
-	if total <= 0 {
-		total = 1
-	}
-	if step < 0 {
-		step = 0
-	}
-	if step > total {
-		step = total
-	}
-	p.total = total
-
-	if !p.enabled {
-		fmt.Printf("[%d/%d] %s\n", step, total, message)
-		return
-	}
-
-	const width = 32
-	filled := step * width / total
-	if filled > width {
-		filled = width
-	}
-
-	percent := step * 100 / total
-	spinner := progressFrames[p.frameIdx%len(progressFrames)]
-	p.frameIdx++
-
-	bar := renderColoredBar(width, filled)
-	elapsed := formatElapsed(time.Since(p.startedAt))
-
-	line := fmt.Sprintf(
-		"\r%s %s %s %3d%% %s %s",
-		colorize("36;1", spinner),
-		colorize("1", p.pkgName),
-		bar,
-		percent,
-		colorize("2", "| "+truncateText(message, 48)),
-		colorize("2", elapsed),
-	)
-
-	if pad := p.lastLineLen - visibleLen(line); pad > 0 {
-		line += strings.Repeat(" ", pad)
-	}
-	p.lastLineLen = visibleLen(line)
-	fmt.Print(line)
+	p.statusBar.Update(step, message)
 }
 
 func (p *progressUI) finish(ok bool, message string) {
-	total := p.total
-	if total <= 0 {
-		total = 1
-	}
-	p.update(total, total, message)
-
-	if p.enabled {
-		status := colorize("31;1", "FAIL")
-		if ok {
-			status = colorize("32;1", "DONE")
-		}
-		fmt.Printf("  %s  %s\n", status, colorize("2", "("+formatElapsed(time.Since(p.startedAt))+")"))
-		return
-	}
-
-	fmt.Println()
+	p.statusBar.Finish(ok, message)
 }
 
 var progressFrames = []string{"|", "/", "-", "\\"}

@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,13 @@ func (b *Builder) Build(recipe *recipe.Recipe) error {
 		return fmt.Errorf("recipe cannot be nil")
 	}
 
+	// Check if package already exists in cache
+	packageFile := filepath.Join(recipe.GetPackageDir(b.workDir), recipe.GetPackageFileName())
+	if _, err := os.Stat(packageFile); err == nil {
+		log.Printf("Package %s already exists, skipping build", recipe.GetPackageName())
+		return nil
+	}
+
 	totalSteps := 4 + len(recipe.Build) + len(recipe.Install)
 	step := 0
 	nextStep := func(message string) {
@@ -68,6 +76,12 @@ func (b *Builder) Build(recipe *recipe.Recipe) error {
 	nextStep("Applying recipe patches")
 	if err := b.applyPatches(recipe, sourceDir); err != nil {
 		return fmt.Errorf("failed to apply patches: %w", err)
+	}
+
+	// Validate source files
+	nextStep("Validating source files")
+	if err := b.validateSourceFiles(recipe, sourceDir); err != nil {
+		return fmt.Errorf("failed to validate source files: %w", err)
 	}
 
 	// Build package
@@ -229,6 +243,13 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 	if strings.TrimSpace(command) == "" {
 		return nil
 	}
+
+	// Security check
+	if err := b.validateCommand(command); err != nil {
+		return fmt.Errorf("command security validation failed: %w", err)
+	}
+
+	log.Printf("Executing command: %s", command)
 
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = workDir
@@ -397,6 +418,61 @@ func (b *Builder) SetEnvOverrides(overrides map[string]string) {
 	b.envOverrides = cloned
 }
 
+// CleanCache removes cached packages and sources
+func (b *Builder) CleanCache() error {
+	cacheDirs := []string{
+		filepath.Join(b.workDir, "cache"),
+		filepath.Join(b.workDir, "packages"),
+		filepath.Join(b.workDir, "sources"),
+		filepath.Join(b.workDir, "staging"),
+	}
+
+	for _, dir := range cacheDirs {
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("failed to clean cache directory %s: %w", dir, err)
+		}
+	}
+
+	log.Printf("Cache cleaned successfully")
+	return nil
+}
+
+// GetCacheSize returns total size of cache directories
+func (b *Builder) GetCacheSize() (int64, error) {
+	var totalSize int64
+	cacheDirs := []string{
+		filepath.Join(b.workDir, "cache"),
+		filepath.Join(b.workDir, "packages"),
+		filepath.Join(b.workDir, "sources"),
+		filepath.Join(b.workDir, "staging"),
+	}
+
+	for _, dir := range cacheDirs {
+		size, err := b.dirSize(dir)
+		if err != nil {
+			return 0, fmt.Errorf("failed to calculate size of %s: %w", dir, err)
+		}
+		totalSize += size
+	}
+
+	return totalSize, nil
+}
+
+// dirSize calculates total size of directory recursively
+func (b *Builder) dirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}
+
 // substituteVariables substitutes variables in command strings
 func (b *Builder) substituteVariables(cmdStr, sourceDir, stagingDir string) string {
 	// Get number of CPU cores
@@ -489,4 +565,155 @@ func applyEnvOverrides(base []string, overrides map[string]string) []string {
 	}
 
 	return out
+}
+
+// validateSourceFiles checks if essential files are present after extraction
+func (b *Builder) validateSourceFiles(recipe *recipe.Recipe, sourceDir string) error {
+	// Find the actual source directory
+	srcPath, err := b.findSourceDirectory(sourceDir)
+	if err != nil {
+		return fmt.Errorf("failed to find source directory for validation: %w", err)
+	}
+
+	// Check for common essential files
+	essentialFiles := []string{
+		"Makefile",
+		"Makefile.in", 
+		"configure",
+		"configure.ac",
+		"CMakeLists.txt",
+		"meson.build",
+		"setup.py",
+		"Cargo.toml",
+		"go.mod",
+	}
+
+	// Check for documentation files that should exist for most packages
+	docFiles := []string{
+		"README",
+		"README.md",
+		"README.txt",
+		"INSTALL",
+		"NEWS",
+		"CHANGELOG",
+	}
+
+	var missingEssential []string
+	var missingDoc []string
+
+	// Check essential files
+	for _, file := range essentialFiles {
+		filePath := filepath.Join(srcPath, file)
+		if _, err := os.Stat(filePath); err == nil {
+			// Found at least one essential file, that's good enough
+			missingEssential = nil
+			break
+		}
+	}
+
+	// If no essential files found, check documentation
+	if len(missingEssential) == 0 {
+		for _, file := range docFiles {
+			filePath := filepath.Join(srcPath, file)
+			if _, err := os.Stat(filePath); err == nil {
+				// Found documentation, that's acceptable
+				missingDoc = nil
+				break
+			}
+		}
+	}
+
+	// Special checks for common packages
+	if recipe.Name == "emacs" {
+		emacsFiles := []string{
+			"src/emacs.c",
+			"lisp/emacs-lisp/lisp-mode.el",
+			"doc/emacs/Makefile.in",
+		}
+		for _, file := range emacsFiles {
+			filePath := filepath.Join(srcPath, file)
+			if _, err := os.Stat(filePath); err != nil {
+				return fmt.Errorf("emacs source validation failed: missing essential file %s", file)
+			}
+		}
+	}
+
+	// Check if directory is not empty
+	entries, err := os.ReadDir(srcPath)
+	if err != nil {
+		return fmt.Errorf("failed to read source directory: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return fmt.Errorf("source directory is empty after extraction")
+	}
+
+	// Log warning if no essential files found
+	if len(missingEssential) == 0 && len(missingDoc) == 0 {
+		fmt.Printf("Warning: No essential build files found in %s\n", srcPath)
+	}
+
+	return nil
+}
+
+// validateCommand performs basic security checks on build commands
+func (b *Builder) validateCommand(command string) error {
+	// List of dangerous patterns to block
+	dangerousPatterns := []string{
+		"rm -rf /",
+		"rm -rf /*", 
+		":(){ :|:& };:", // fork bomb
+		"chmod 777 /",
+		"chown root",
+		"sudo ",
+		"su ",
+		"passwd",
+		"curl | sh",
+		"wget | sh",
+		"eval $(",
+		"sh -c $(",
+		"bash -c $(",
+		"> /dev/sda",
+		"> /dev/hda",
+		"mkfs",
+		"format",
+		"fdisk",
+	}
+
+	cmdLower := strings.ToLower(command)
+	
+	// Check for dangerous patterns
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(cmdLower, pattern) {
+			return fmt.Errorf("command contains potentially dangerous pattern: %s", pattern)
+		}
+	}
+
+	// Check for suspicious characters that might indicate injection
+	suspiciousChars := []string{"\x00", "\r", "\n", "\t"}
+	for _, char := range suspiciousChars {
+		if strings.Contains(command, char) {
+			return fmt.Errorf("command contains suspicious character: %q", char)
+		}
+	}
+
+	// Basic command structure validation
+	commands := strings.Fields(command)
+	if len(commands) == 0 {
+		return fmt.Errorf("empty command")
+	}
+
+	// Check for extremely long commands (possible injection attempt)
+	if len(command) > 1000 {
+		return fmt.Errorf("command too long (%d characters)", len(command))
+	}
+
+	// Log the command for audit purposes (only first 100 chars)
+	if len(command) > 100 {
+		log.Printf("Command validation passed (truncated): %s...", command[:100])
+	} else {
+		log.Printf("Command validation passed: %s", command)
+	}
+
+	return nil
 }
