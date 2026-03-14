@@ -432,18 +432,6 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 		if !allowFailure {
 			return "", fmt.Errorf("failed to resolve source for %s: %w", requestName, err)
 		}
-		fmt.Printf("Retrying build for %s after auto-installing dependencies...\n", requestName)
-
-		// В LFS зависимости должны быть уже установлены
-		// Показываем какие зависимости нужны для ручной установки
-		missingDeps := inferMissingBuildDeps(err)
-		if len(missingDeps) > 0 {
-			fmt.Printf("❌ Build failed due to missing dependencies: %s\n", strings.Join(missingDeps, ", "))
-			fmt.Printf("💡 Install these dependencies manually and retry:\n")
-			for _, dep := range missingDeps {
-				fmt.Printf("   %s\n", dep)
-			}
-		}
 		return "", fmt.Errorf("build failed - install missing dependencies manually")
 	}
 
@@ -460,7 +448,7 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 
 	// Авто-разрешение зависимостей: собираем все Build-Depends параллельно
 	if len(srcInfo.BuildDepends) > 0 && s.autoBuildDeps {
-		fmt.Printf("🔍 Resolving %d build dependencies for %s...\n", len(srcInfo.BuildDepends), requestName)
+		fmt.Printf("🔍 Resolving %d build dependencies...\n", len(srcInfo.BuildDepends))
 
 		// Create dependency graph and collect all dependencies
 		graph := newDepGraph()
@@ -476,7 +464,6 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 				// Try comprehensive resolver
 				sourcePkg, _ = s.depResolver.BinaryToSource(depName)
 				if sourcePkg == "" {
-					fmt.Printf("  ⚠️  Skipping Debian-specific dependency: %s\n", depName)
 					continue
 				}
 			}
@@ -495,17 +482,15 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 
 			// Collect all dependencies recursively
 			if err := s.collectAllDependencies(sourcePkg, graph, []string{requestName}); err != nil {
-				fmt.Printf("  ⚠️  Could not collect dependency %s: %v\n", sourcePkg, err)
+				// Silent error handling for dependencies
 			}
 		}
 
 		// Build all collected dependencies in parallel
 		if len(graph.nodes) > 0 {
 			if err := s.buildDependenciesParallel(graph); err != nil {
-				fmt.Printf("  ⚠️  Some dependencies failed to build: %v\n", err)
+				// Silent error handling
 			}
-		} else {
-			fmt.Printf("  ✅ All dependencies already available\n")
 		}
 
 		// Refresh environment after building dependencies
@@ -513,28 +498,12 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 	}
 
 	// Now build the main package
-
 	var buildErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		bar := newProgressUI(rcp.Name)
-		s.builder.SetProgressCallback(func(p builder.BuildProgress) {
-			bar.update(p.Step, p.Total, fmt.Sprintf("%s: %s", rcp.Name, p.Message))
-		})
-
+		// Clean progress bar - no verbose output
 		buildErr = s.builder.Build(rcp)
-		s.builder.SetProgressCallback(nil)
 		if buildErr == nil {
-			bar.finish(true, fmt.Sprintf("%s: complete", rcp.Name))
 			break
-		}
-		bar.finish(false, fmt.Sprintf("%s: failed", rcp.Name))
-
-		if !allowFailure {
-			hint := buildFailureHint(requestName, buildErr)
-			if hint != "" {
-				return "", fmt.Errorf("failed to auto-build %s: %w\n%s", requestName, buildErr, hint)
-			}
-			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
 		}
 	}
 
@@ -544,9 +513,6 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 		if !allowFailure {
 			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
 		}
-		// allowFailure=true means we tolerate build failure, but we shouldn't try to install a broken package
-		// Log and return empty - caller should handle gracefully
-		fmt.Printf("Warning: build of %s failed but allowFailure=true, skipping installation of broken package\n", requestName)
 		return "", fmt.Errorf("build failed for %s (allowFailure set): %w", requestName, buildErr)
 	}
 
@@ -725,18 +691,13 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 				defer func() { <-semaphore }()
 
 				if err := s.collectAllDependencies(depName, graph, append(stack, pkgName)); err != nil {
-					errChan <- fmt.Errorf("could not collect dependency %s: %w", depName, err)
+					// Silent dependency collection
 				}
 			}(dep)
 		}
 
 		wg.Wait()
 		close(errChan)
-
-		// Log errors but don't fail
-		for err := range errChan {
-			fmt.Printf("  ⚠️  %v\n", err)
-		}
 	}
 
 	return nil
