@@ -89,7 +89,7 @@ var InstallCmd = &cobra.Command{
 				continue
 			}
 
-			builtPackage, err := session.buildPackage(target, false, nil)
+			builtPackage, err := session.buildPackageWithFallback(target, false, false, []string{})
 			if err != nil {
 				return err
 			}
@@ -245,7 +245,7 @@ func (s *autoBuildSession) refreshBuildEnv() {
 	s.builder.SetEnvOverride("CMAKE_PREFIX_PATH", joinPathListUnique(cmakePrefixes))
 }
 
-func (s *autoBuildSession) buildPackage(requestName string, asBuildDep bool, stack []string) (string, error) {
+func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildDep bool, allowFailure bool, stack []string) (string, error) {
 	requestName = normalizePackageName(requestName)
 	if requestName == "" {
 		return "", fmt.Errorf("invalid package name")
@@ -270,16 +270,20 @@ func (s *autoBuildSession) buildPackage(requestName string, asBuildDep bool, sta
 	s.buildingPackages[requestName] = struct{}{}
 	defer delete(s.buildingPackages, requestName)
 
-	fmt.Printf("Resolving Debian source for %s...\n", requestName)
+	// Resolve source
 	srcInfo, err := s.resolver.ResolveSource(requestName)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve source for %s: %w", requestName, err)
+		if !allowFailure {
+			return "", fmt.Errorf("failed to resolve source for %s: %w", requestName, err)
+		}
+		fmt.Printf("Warning: failed to resolve source for %s: %v (continuing anyway)\n", requestName, err)
+		return "", nil
 	}
 
 	rcp := autoRecipeFromDebian(srcInfo)
 	normalizedRecipeName := normalizePackageName(rcp.Name)
 	if normalizedRecipeName != "" && normalizedRecipeName != requestName {
-		// Alias the resolved source package name to the requested name.
+		// Alias resolved source package name to requested name.
 		if _, exists := s.buildingPackages[normalizedRecipeName]; exists {
 			return "", fmt.Errorf("dependency cycle detected: %s", strings.Join(append(stack, requestName, normalizedRecipeName), " -> "))
 		}
@@ -301,52 +305,22 @@ func (s *autoBuildSession) buildPackage(requestName string, asBuildDep bool, sta
 		}
 		bar.finish(false, fmt.Sprintf("%s: failed", rcp.Name))
 
-		if !s.autoBuildDeps || attempt == 1 {
+		if !allowFailure {
 			hint := buildFailureHint(requestName, buildErr)
 			if hint != "" {
 				return "", fmt.Errorf("failed to auto-build %s: %w\n%s", requestName, buildErr, hint)
 			}
 			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
 		}
-
-		missingDeps := inferMissingBuildDeps(buildErr)
-		if len(missingDeps) == 0 {
-			hint := buildFailureHint(requestName, buildErr)
-			if hint != "" {
-				return "", fmt.Errorf("failed to auto-build %s: %w\n%s", requestName, buildErr, hint)
-			}
-			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
-		}
-
-		fmt.Printf("Detected missing build dependencies for %s: %s\n", requestName, strings.Join(missingDeps, ", "))
-		for _, dep := range missingDeps {
-			if dep == requestName || dep == normalizedRecipeName {
-				continue
-			}
-			if _, ready := s.toolDepsReady[dep]; ready {
-				continue
-			}
-			if err := s.ensureBuildDependency(dep, append(stack, requestName)); err != nil {
-				return "", fmt.Errorf("failed to satisfy build dependency %s for %s: %w", dep, requestName, err)
-			}
-		}
-
-		fmt.Printf("Retrying build for %s after auto-installing dependencies...\n", requestName)
-	}
-
-	if buildErr != nil {
-		return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
 	}
 
 	builtPackage := filepath.Join(rcp.GetPackageDir(s.workDir), rcp.GetPackageFileName())
-	fmt.Printf("Built package: %s\n", builtPackage)
+	s.builtPackages[rcp.Name] = builtPackage
 
-	s.builtPackages[requestName] = builtPackage
-	if normalizedRecipeName != "" {
-		s.builtPackages[normalizedRecipeName] = builtPackage
-	}
-
-	if asBuildDep {
+	if buildErr != nil {
+		if !allowFailure {
+			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
+		}
 		if err := s.installBuildDependency(requestName, builtPackage); err != nil {
 			return "", err
 		}
@@ -369,11 +343,11 @@ func (s *autoBuildSession) ensureBuildDependency(dep string, stack []string) err
 		return nil
 	}
 
-	packagePath, err := s.buildPackage(dep, true, stack)
+	fmt.Printf("Installing build dependency %s into %s...\n", dep, s.toolRoot)
+	packagePath, err := s.buildPackageWithFallback(dep, true, false, append(stack, dep))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to build dependency %s: %w", dep, err)
 	}
-
 	return s.installBuildDependency(dep, packagePath)
 }
 
@@ -700,49 +674,10 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 		version = "0"
 	}
 
-	// Map package names to binary names for common packages
-	binaryName := name
-	switch name {
-	case "lua5.1":
-		binaryName = "lua"
-	case "python3":
-		binaryName = "python3"
-	case "python3-dev":
-		binaryName = "python3-config"
-	case "gcc":
-		binaryName = "gcc"
-	case "make":
-		binaryName = "make"
-	case "git":
-		binaryName = "git"
-	case "cmake":
-		binaryName = "cmake"
-	case "pkgconf":
-		binaryName = "pkgconf"
+	// Use external install script to avoid shell escaping issues
+	installCommands := []string{
+		"PKGDIR={{pkgdir}} bash /tmp/install-script.sh",
 	}
-
-	// More robust install command with proper fallbacks
-	installCmd := fmt.Sprintf(
-		"if [ -f build/cmake_install.cmake ]; then DESTDIR={{pkgdir}} cmake --install build; "+
-			"elif [ -f build/meson-private/coredata.dat ]; then DESTDIR={{pkgdir}} meson install -C build ${ZSVO_MESON_INSTALL_ARGS}; "+
-			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make DESTDIR={{pkgdir}} PREFIX=/usr ${ZSVO_MAKE_INSTALL_FLAGS} install; "+
-			"else "+
-			"  # Try to find and install binaries manually "+
-			"  bin_found=false; "+
-			"  for bin_dir in src .; do "+
-			"    if [ -f \"$$bin_dir/%s\" ]; then "+
-			"      install -Dm755 \"$$bin_dir/%s\" \"{{pkgdir}}/usr/bin/%s\"; "+
-			"      bin_found=true; "+
-			"      break; "+
-			"    fi; "+
-			"  done; "+
-			"  if [ \"$$bin_found\" = \"false\" ]; then "+
-			"    echo \"Warning: No binary found for %s, installing common files\"; "+
-			"    mkdir -p \"{{pkgdir}}/usr/bin\" \"{{pkgdir}}/usr/lib\" \"{{pkgdir}}/usr/include\" 2>/dev/null || true; "+
-			"  fi; "+
-			"fi",
-		binaryName, binaryName, binaryName, name,
-	)
 
 	return &recipe.Recipe{
 		Name:        name,
@@ -758,7 +693,7 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 				"elif [ -f meson.build ]; then meson setup build --prefix=/usr ${ZSVO_MESON_SETUP_ARGS} && meson compile -C build -j${jobs} ${ZSVO_MESON_COMPILE_ARGS}; " +
 				"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make -j${jobs} ${ZSVO_MAKE_FLAGS}; fi",
 		},
-		Install: []string{installCmd},
+		Install: installCommands,
 	}
 }
 
