@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"zsvo/pkg/builder"
@@ -185,6 +186,7 @@ func looksLikeFilePath(target string) bool {
 }
 
 const maxAutoBuildDepth = 15 // Увеличим для сложных цепочек зависимостей
+const parallelWorkers = 4    // Количество параллельных воркеров для сборки
 
 type autoBuildSession struct {
 	workDir          string
@@ -197,6 +199,157 @@ type autoBuildSession struct {
 	builtPackages    map[string]string
 	toolDepsReady    map[string]struct{}
 	buildingPackages map[string]struct{}
+}
+
+// depNode represents a node in the dependency graph
+type depNode struct {
+	name         string
+	deps         []string // dependencies this package needs
+	dependents   []string // packages that depend on this one
+	buildDepends []string // original Build-Depends from Debian
+	level        int      // dependency level (0 = no deps, 1 = depends on level 0, etc.)
+	srcInfo      *debian.SourceInfo
+	recipe       *recipe.Recipe
+	built        bool
+	err          error
+}
+
+// depGraph manages the dependency tree for parallel building
+type depGraph struct {
+	nodes map[string]*depNode
+	mu    sync.RWMutex
+}
+
+// newDepGraph creates a new dependency graph
+func newDepGraph() *depGraph {
+	return &depGraph{
+		nodes: make(map[string]*depNode),
+	}
+}
+
+// getOrCreateNode gets or creates a node in the graph
+func (g *depGraph) getOrCreateNode(name string) *depNode {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if node, exists := g.nodes[name]; exists {
+		return node
+	}
+
+	node := &depNode{
+		name:         name,
+		deps:         []string{},
+		dependents:   []string{},
+		buildDepends: []string{},
+		level:        -1, // -1 means not calculated yet
+	}
+	g.nodes[name] = node
+	return node
+}
+
+// addDependency adds a dependency relationship: pkg depends on dep
+func (g *depGraph) addDependency(pkg, dep string) {
+	pkgNode := g.getOrCreateNode(pkg)
+	depNode := g.getOrCreateNode(dep)
+
+	// Add to deps list if not already there
+	found := false
+	for _, d := range pkgNode.deps {
+		if d == dep {
+			found = true
+			break
+		}
+	}
+	if !found {
+		pkgNode.deps = append(pkgNode.deps, dep)
+	}
+
+	// Add to dependents list if not already there
+	found = false
+	for _, d := range depNode.dependents {
+		if d == pkg {
+			found = true
+			break
+		}
+	}
+	if !found {
+		depNode.dependents = append(depNode.dependents, pkg)
+	}
+}
+
+// calculateLevels calculates dependency levels (topological sort layers)
+func (g *depGraph) calculateLevels() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Reset all levels
+	for _, node := range g.nodes {
+		node.level = -1
+	}
+
+	// Find all nodes with no dependencies (level 0)
+	queue := make([]*depNode, 0)
+	for _, node := range g.nodes {
+		// Count only unbuilt dependencies
+		unbuiltDeps := 0
+		for _, dep := range node.deps {
+			if depNode, exists := g.nodes[dep]; exists && !depNode.built {
+				unbuiltDeps++
+			}
+		}
+		if unbuiltDeps == 0 {
+			node.level = 0
+			queue = append(queue, node)
+		}
+	}
+
+	// BFS to calculate levels
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		for _, depName := range current.dependents {
+			depNode := g.nodes[depName]
+			if depNode.level == -1 || depNode.level < current.level+1 {
+				depNode.level = current.level + 1
+				queue = append(queue, depNode)
+			}
+		}
+	}
+}
+
+// getNodesByLevel returns all nodes at a specific level, sorted by name
+func (g *depGraph) getNodesByLevel(level int) []*depNode {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	result := make([]*depNode, 0)
+	for _, node := range g.nodes {
+		if node.level == level {
+			result = append(result, node)
+		}
+	}
+
+	// Sort by name for deterministic order
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].name < result[j].name
+	})
+
+	return result
+}
+
+// getMaxLevel returns the maximum dependency level
+func (g *depGraph) getMaxLevel() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	max := 0
+	for _, node := range g.nodes {
+		if node.level > max {
+			max = node.level
+		}
+	}
+	return max
 }
 
 func newAutoBuildSession(workDir string, autoBuildDeps bool) *autoBuildSession {
@@ -304,12 +457,12 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 
 	fmt.Printf("Building %s from %s...\n", rcp.GetPackageName(), srcInfo.DSCURL)
 
-	// Авто-разрешение зависимостей: строим все Build-Depends рекурсивно
+	// Авто-разрешение зависимостей: собираем все Build-Depends параллельно
 	if len(srcInfo.BuildDepends) > 0 && s.autoBuildDeps {
 		fmt.Printf("🔍 Resolving %d build dependencies for %s...\n", len(srcInfo.BuildDepends), requestName)
 
-		// Collect dependencies that need to be built
-		depsToBuild := make([]string, 0)
+		// Create dependency graph and collect all dependencies
+		graph := newDepGraph()
 		for _, dep := range srcInfo.BuildDepends {
 			depName := extractPackageNameFromConstraint(dep)
 			if depName == "" {
@@ -339,27 +492,23 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 				continue
 			}
 
-			depsToBuild = append(depsToBuild, sourcePkg)
+			// Collect all dependencies recursively
+			if err := s.collectAllDependencies(sourcePkg, graph, []string{requestName}); err != nil {
+				fmt.Printf("  ⚠️  Could not collect dependency %s: %v\n", sourcePkg, err)
+			}
 		}
 
-		// Build all dependencies first (in order)
-		if len(depsToBuild) > 0 {
-			fmt.Printf("📦 Need to build %d dependencies: %s\n", len(depsToBuild), strings.Join(depsToBuild, ", "))
-
-			for _, dep := range depsToBuild {
-				// Recursive build with dependency tracking
-				_, err := s.buildPackageWithFallback(dep, true, false, append(stack, requestName))
-				if err != nil {
-					fmt.Printf("  ⚠️  Failed to build dependency %s: %v (continuing anyway)\n", dep, err)
-					// Don't fail immediately - the main package might still build
-				}
+		// Build all collected dependencies in parallel
+		if len(graph.nodes) > 0 {
+			if err := s.buildDependenciesParallel(graph); err != nil {
+				fmt.Printf("  ⚠️  Some dependencies failed to build: %v\n", err)
 			}
-
-			// Refresh environment after building dependencies
-			s.refreshBuildEnv()
 		} else {
 			fmt.Printf("  ✅ All dependencies already available\n")
 		}
+
+		// Refresh environment after building dependencies
+		s.refreshBuildEnv()
 	}
 
 	// Now build the main package
@@ -489,6 +638,192 @@ func (s *autoBuildSession) installBuildDependency(dep, packagePath string) error
 	s.toolDepsReady[dep] = struct{}{}
 	s.refreshBuildEnv()
 	return nil
+}
+
+// collectAllDependencies recursively collects all dependencies into a graph without building
+func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGraph, stack []string) error {
+	rootPkg = normalizePackageName(rootPkg)
+	if rootPkg == "" {
+		return fmt.Errorf("invalid package name")
+	}
+
+	if len(stack) >= maxAutoBuildDepth {
+		return fmt.Errorf("dependency chain is too deep while building %s", rootPkg)
+	}
+
+	// Check for cycles
+	for _, s := range stack {
+		if s == rootPkg {
+			return fmt.Errorf("dependency cycle detected: %s", strings.Join(append(stack, rootPkg), " -> "))
+		}
+	}
+
+	// Skip if already processed
+	node := graph.getOrCreateNode(rootPkg)
+	if node.srcInfo != nil {
+		return nil
+	}
+
+	// Resolve source
+	srcInfo, err := s.resolver.ResolveSource(rootPkg)
+	if err != nil {
+		return fmt.Errorf("failed to resolve source for %s: %w", rootPkg, err)
+	}
+
+	// Create recipe to get proper package name
+	rcp := autoRecipeFromDebian(srcInfo)
+	pkgName := rcp.Name
+
+	node = graph.getOrCreateNode(pkgName)
+	node.srcInfo = srcInfo
+	node.recipe = rcp
+	node.buildDepends = srcInfo.BuildDepends
+
+	// Process build dependencies
+	for _, dep := range srcInfo.BuildDepends {
+		depName := extractPackageNameFromConstraint(dep)
+		if depName == "" {
+			continue
+		}
+
+		// Map to source package
+		sourcePkg := mapDebianPackageToSource(depName)
+		if sourcePkg == "" {
+			sourcePkg, _ = s.depResolver.BinaryToSource(depName)
+		}
+		if sourcePkg == "" || toolAlreadyAvailable(sourcePkg) {
+			continue
+		}
+
+		// Add dependency relationship
+		graph.addDependency(pkgName, sourcePkg)
+
+		// Recursively collect this dependency's dependencies
+		if err := s.collectAllDependencies(sourcePkg, graph, append(stack, pkgName)); err != nil {
+			// Log but don't fail - some deps might be optional
+			fmt.Printf("  ⚠️  Could not collect dependency %s: %v\n", sourcePkg, err)
+		}
+	}
+
+	return nil
+}
+
+// buildDependenciesParallel builds all dependencies in parallel using worker pools
+func (s *autoBuildSession) buildDependenciesParallel(graph *depGraph) error {
+	// Calculate dependency levels for topological sort
+	graph.calculateLevels()
+
+	maxLevel := graph.getMaxLevel()
+	if maxLevel == 0 && len(graph.nodes) == 0 {
+		return nil
+	}
+
+	fmt.Printf("\n📊 Dependency graph: %d packages, %d levels\n", len(graph.nodes), maxLevel+1)
+
+	// Build level by level (respecting dependencies)
+	for level := 0; level <= maxLevel; level++ {
+		nodes := graph.getNodesByLevel(level)
+		if len(nodes) == 0 {
+			continue
+		}
+
+		// Filter out already built packages
+		nodesToBuild := make([]*depNode, 0)
+		for _, node := range nodes {
+			if _, built := s.builtPackages[node.name]; !built && !toolAlreadyAvailable(node.name) {
+				nodesToBuild = append(nodesToBuild, node)
+			}
+		}
+
+		if len(nodesToBuild) == 0 {
+			continue
+		}
+
+		fmt.Printf("\n🔨 Level %d: Building %d packages in parallel...\n", level, len(nodesToBuild))
+		for _, n := range nodesToBuild {
+			fmt.Printf("   - %s\n", n.name)
+		}
+
+		// Build this level in parallel
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(nodesToBuild))
+
+		// Limit concurrent builds
+		semaphore := make(chan struct{}, parallelWorkers)
+
+		for _, node := range nodesToBuild {
+			wg.Add(1)
+			go func(n *depNode) {
+				defer wg.Done()
+
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+
+				// Build the package
+				_, err := s.buildPackageFromNode(n)
+				if err != nil {
+					n.err = err
+					errChan <- fmt.Errorf("%s: %w", n.name, err)
+				} else {
+					n.built = true
+				}
+			}(node)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		// Check for errors
+		errors := make([]error, 0)
+		for err := range errChan {
+			errors = append(errors, err)
+		}
+
+		if len(errors) > 0 {
+			fmt.Printf("⚠️  %d packages failed at level %d\n", len(errors), level)
+			for _, err := range errors {
+				fmt.Printf("   %v\n", err)
+			}
+		}
+
+		// Refresh environment after each level
+		s.refreshBuildEnv()
+	}
+
+	return nil
+}
+
+// buildPackageFromNode builds a single package from a dependency node
+func (s *autoBuildSession) buildPackageFromNode(node *depNode) (string, error) {
+	if node.recipe == nil || node.srcInfo == nil {
+		return "", fmt.Errorf("node %s has no recipe or source info", node.name)
+	}
+
+	// Check if already built
+	if builtPath, ok := s.builtPackages[node.name]; ok {
+		return builtPath, nil
+	}
+
+	fmt.Printf("Building %s from %s...\n", node.recipe.GetPackageName(), node.srcInfo.DSCURL)
+
+	bar := newProgressUI(node.name)
+	s.builder.SetProgressCallback(func(p builder.BuildProgress) {
+		bar.update(p.Step, p.Total, fmt.Sprintf("%s: %s", node.name, p.Message))
+	})
+
+	buildErr := s.builder.Build(node.recipe)
+	s.builder.SetProgressCallback(nil)
+
+	if buildErr != nil {
+		bar.finish(false, fmt.Sprintf("%s: failed", node.name))
+		return "", fmt.Errorf("failed to build %s: %w", node.name, buildErr)
+	}
+
+	bar.finish(true, fmt.Sprintf("%s: complete", node.name))
+
+	builtPackage := filepath.Join(node.recipe.GetPackageDir(s.workDir), node.recipe.GetPackageFileName())
+	s.builtPackages[node.name] = builtPackage
+	return builtPackage, nil
 }
 
 func splitPathList(value string) []string {

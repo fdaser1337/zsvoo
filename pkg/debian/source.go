@@ -36,6 +36,9 @@ type SourceInfo struct {
 	BuildDepends     []string // Build dependencies from DSC file
 }
 
+const maxAutoBuildDepth = 15 // Увеличим для сложных цепочек зависимостей
+const parallelWorkers = 1    // Временно отключаем параллельную сборку (1 воркер = последовательно)
+
 // Resolver queries Debian source metadata over HTTP.
 type Resolver struct {
 	client     *http.Client
@@ -75,7 +78,14 @@ func WithComponents(components []string) ResolverOption {
 
 func NewResolver(opts ...ResolverOption) *Resolver {
 	r := &Resolver{
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		},
 		mirrors: []string{
 			defaultDebianMirror,
 		},
@@ -108,16 +118,25 @@ func (r *Resolver) ResolveSource(pkg string) (*SourceInfo, error) {
 		return nil, fmt.Errorf("invalid package name %q", pkg)
 	}
 
+	fmt.Printf("  [resolver] Looking up %s...\n", pkg)
+	start := time.Now()
+	defer func() {
+		fmt.Printf("  [resolver] %s lookup took %v\n", pkg, time.Since(start))
+	}()
+
 	checked := make([]string, 0, len(r.mirrors)*len(r.suites)*len(r.components))
 	for _, mirror := range r.mirrors {
 		for _, suite := range r.suites {
 			for _, component := range r.components {
+				fmt.Printf("  [resolver] Checking %s/%s/%s...\n", mirror, suite, component)
 				record, err := r.findPackageInIndex(mirror, suite, component, pkg)
 				checked = append(checked, fmt.Sprintf("%s:%s/%s", mirror, suite, component))
 				if err != nil {
+					fmt.Printf("  [resolver] Not found in %s/%s/%s: %v\n", mirror, suite, component, err)
 					continue
 				}
 
+				fmt.Printf("  [resolver] ✓ Found %s in %s/%s/%s\n", pkg, mirror, suite, component)
 				return &SourceInfo{
 					RequestedPackage: pkg,
 					SourcePackage:    record.Package,
