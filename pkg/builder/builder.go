@@ -259,8 +259,8 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 	cmd.Dir = workDir
 	cmd.Env = env
 	if b.quiet {
-		// Create a context with timeout to prevent hanging
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		// Create a context with timeout to prevent hanging - use 2 hours for large packages like gcc/llvm
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 		defer cancel()
 
 		cmd := exec.CommandContext(ctx, "sh", "-c", command)
@@ -277,8 +277,8 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 		return nil
 	}
 
-	// For non-quiet mode, still set a reasonable timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// For non-quiet mode, still set a reasonable timeout - use 2 hours for large packages
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	cmd = exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = workDir
@@ -614,45 +614,71 @@ func (b *Builder) validateSourceFiles(recipe *recipe.Recipe, sourceDir string) e
 }
 
 func (b *Builder) validateCommand(command string) error {
-	// List of dangerous patterns to block
+	// Normalize for pattern matching
+	cmdLower := strings.ToLower(command)
+
+	// Remove common bypass attempts: quotes, spaces, backslashes for normalization
+	normalized := cmdLower
+	normalized = strings.ReplaceAll(normalized, `"`, "")
+	normalized = strings.ReplaceAll(normalized, `'`, "")
+	normalized = strings.ReplaceAll(normalized, ` `, "")
+	normalized = strings.ReplaceAll(normalized, `\`, "")
+
+	// List of dangerous patterns to block (check both original and normalized)
 	dangerousPatterns := []string{
 		"rm -rf /",
 		"rm -rf /*",
-		":(){ :|:& };:", // fork bomb
+		"rm -rf/",
+		`:(){:|:&};:`,   // fork bomb (normalized)
+		":(){ :|:& };:", // fork bomb (original)
 		"chmod 777 /",
 		"chown root",
 		"sudo ",
-		"su ",
+		"su -",
 		"> /dev/sda",
 		"> /dev/hda",
+		">/dev/sda",
+		">/dev/hda",
 		"mkfs",
-		"format",
+		"format /",
 		"fdisk",
-		// Additional patterns
 		"dd if=",
 		"chmod -R 777 /",
 		"chown -R root",
-		"rm -rf /*",
 		"rm -rf /etc",
 		"rm -rf /usr",
 		"rm -rf /bin",
 		"rm -rf /sbin",
 		"rm -rf /lib",
 		"rm -rf /lib64",
+		"rm-rf/etc",
+		"rm-rf/usr",
+		"rm-rf/bin",
+		"rm-rf/sbin",
+		"rm-rf/lib",
+		"rm-rf/lib64",
 		"shutdown",
 		"reboot",
 		"halt",
 		"poweroff",
 		"init 0",
 		"init 6",
+		"eval",
+		"$(", // command substitution
+		"${", // parameter expansion
 	}
 
-	cmdLower := strings.ToLower(command)
-
-	// Check for dangerous patterns
+	// Check against original
 	for _, pattern := range dangerousPatterns {
 		if strings.Contains(cmdLower, pattern) {
 			return fmt.Errorf("command contains potentially dangerous pattern: %s", pattern)
+		}
+	}
+
+	// Check against normalized (catches bypass attempts like 'rm -rf "/"' or 'rm -rf / ')
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(normalized, pattern) {
+			return fmt.Errorf("command contains potentially dangerous pattern (normalized): %s", pattern)
 		}
 	}
 
@@ -676,14 +702,12 @@ func (b *Builder) validateCommand(command string) error {
 	}
 
 	// Check for command substitution patterns that could bypass security
-	dangerousSubstitutions := []string{
-		"`",
-		"$|",
+	// Backticks and $() are blocked
+	if strings.Contains(command, "`") {
+		return fmt.Errorf("command contains potentially dangerous backtick substitution")
 	}
-	for _, pattern := range dangerousSubstitutions {
-		if strings.Contains(command, pattern) {
-			return fmt.Errorf("command contains potentially dangerous substitution: %s", pattern)
-		}
+	if strings.Contains(command, "$(") {
+		return fmt.Errorf("command contains potentially dangerous command substitution $()")
 	}
 
 	// Log the command for audit purposes (only first 100 chars)

@@ -191,6 +191,7 @@ type autoBuildSession struct {
 	toolRoot         string
 	autoBuildDeps    bool
 	resolver         *debian.Resolver
+	depResolver      *debian.DependencyResolver
 	builder          *builder.Builder
 	toolInstaller    *installer.Installer
 	builtPackages    map[string]string
@@ -207,6 +208,7 @@ func newAutoBuildSession(workDir string, autoBuildDeps bool) *autoBuildSession {
 		toolRoot:         filepath.Join(workDir, "bootstrap-root"),
 		autoBuildDeps:    autoBuildDeps,
 		resolver:         debian.NewResolver(),
+		depResolver:      debian.NewDependencyResolver(),
 		builder:          b,
 		toolInstaller:    installer.NewInstaller(filepath.Join(workDir, "bootstrap-root")),
 		builtPackages:    make(map[string]string),
@@ -302,13 +304,65 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 
 	fmt.Printf("Building %s from %s...\n", rcp.GetPackageName(), srcInfo.DSCURL)
 
-	// ВАЖНО: Мы НЕ собираем Debian зависимости!
-	// Мы используем Debian только как источник исходников
-	// Все зависимости должны быть уже установлены в LFS системе
-	if len(srcInfo.BuildDepends) > 0 {
-		fmt.Printf("⚠️  Found Debian Build-Depends: %s\n", strings.Join(srcInfo.BuildDepends, ", "))
-		fmt.Printf("ℹ️  In LFS, make sure these dependencies are available in your toolchain\n")
+	// Авто-разрешение зависимостей: строим все Build-Depends рекурсивно
+	if len(srcInfo.BuildDepends) > 0 && s.autoBuildDeps {
+		fmt.Printf("🔍 Resolving %d build dependencies for %s...\n", len(srcInfo.BuildDepends), requestName)
+
+		// Collect dependencies that need to be built
+		depsToBuild := make([]string, 0)
+		for _, dep := range srcInfo.BuildDepends {
+			depName := extractPackageNameFromConstraint(dep)
+			if depName == "" {
+				continue
+			}
+
+			// Check if this is a Debian-specific package that should be skipped
+			sourcePkg := mapDebianPackageToSource(depName)
+			if sourcePkg == "" {
+				// Try comprehensive resolver
+				sourcePkg, _ = s.depResolver.BinaryToSource(depName)
+				if sourcePkg == "" {
+					fmt.Printf("  ⚠️  Skipping Debian-specific dependency: %s\n", depName)
+					continue
+				}
+			}
+
+			// Check if already built or available
+			if _, built := s.builtPackages[sourcePkg]; built {
+				continue
+			}
+			if toolAlreadyAvailable(sourcePkg) {
+				s.toolDepsReady[sourcePkg] = struct{}{}
+				continue
+			}
+			if _, ready := s.toolDepsReady[sourcePkg]; ready {
+				continue
+			}
+
+			depsToBuild = append(depsToBuild, sourcePkg)
+		}
+
+		// Build all dependencies first (in order)
+		if len(depsToBuild) > 0 {
+			fmt.Printf("📦 Need to build %d dependencies: %s\n", len(depsToBuild), strings.Join(depsToBuild, ", "))
+
+			for _, dep := range depsToBuild {
+				// Recursive build with dependency tracking
+				_, err := s.buildPackageWithFallback(dep, true, false, append(stack, requestName))
+				if err != nil {
+					fmt.Printf("  ⚠️  Failed to build dependency %s: %v (continuing anyway)\n", dep, err)
+					// Don't fail immediately - the main package might still build
+				}
+			}
+
+			// Refresh environment after building dependencies
+			s.refreshBuildEnv()
+		} else {
+			fmt.Printf("  ✅ All dependencies already available\n")
+		}
 	}
+
+	// Now build the main package
 
 	var buildErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -335,16 +389,18 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 	}
 
 	builtPackage := filepath.Join(rcp.GetPackageDir(s.workDir), rcp.GetPackageFileName())
-	s.builtPackages[rcp.Name] = builtPackage
 
 	if buildErr != nil {
 		if !allowFailure {
 			return "", fmt.Errorf("failed to auto-build %s: %w", requestName, buildErr)
 		}
-		if err := s.installBuildDependency(requestName, builtPackage); err != nil {
-			return "", err
-		}
+		// allowFailure=true means we tolerate build failure, but we shouldn't try to install a broken package
+		// Log and return empty - caller should handle gracefully
+		fmt.Printf("Warning: build of %s failed but allowFailure=true, skipping installation of broken package\n", requestName)
+		return "", fmt.Errorf("build failed for %s (allowFailure set): %w", requestName, buildErr)
 	}
+
+	s.builtPackages[rcp.Name] = builtPackage
 	return builtPackage, nil
 }
 
@@ -353,8 +409,12 @@ func (s *autoBuildSession) installSystemPackage(pkg string, currentBuildingPacka
 	// Try to resolve and build the package as a dependency
 	fmt.Printf("Building system dependency %s through zsvo...\n", pkg)
 
-	// Map common Debian package names to source packages
-	sourcePkg := mapDebianPackageToSource(pkg)
+	// Use comprehensive Debian resolver to map binary package to source
+	sourcePkg, err := s.depResolver.BinaryToSource(pkg)
+	if err != nil {
+		// Fall back to built-in mapping for common packages
+		sourcePkg = mapDebianPackageToSource(pkg)
+	}
 	if sourcePkg == "" {
 		fmt.Printf("Skipping Debian-specific dependency: %s\n", pkg)
 		return nil // Skip Debian-specific packages
@@ -367,7 +427,7 @@ func (s *autoBuildSession) installSystemPackage(pkg string, currentBuildingPacka
 	}
 
 	// Try to build the dependency
-	_, err := s.buildPackageWithFallback(sourcePkg, true, false, []string{})
+	_, err = s.buildPackageWithFallback(sourcePkg, true, false, []string{})
 	if err != nil {
 		return fmt.Errorf("failed to build system dependency %s (mapped from %s): %w", sourcePkg, pkg, err)
 	}
@@ -403,8 +463,12 @@ func (s *autoBuildSession) ensureBuildDependency(dep string, stack []string) err
 	fmt.Printf("Installing build dependency %s into %s...\n", dep, s.toolRoot)
 	packagePath, err := s.buildPackageWithFallback(dep, true, false, append(stack, dep))
 	if err != nil {
-		fmt.Printf("Warning: failed to build dependency %s: %v (continuing anyway)\n", dep, err)
-		// Continue anyway instead of failing
+		fmt.Printf("Warning: failed to build dependency %s: %v (skipping installation)\n", dep, err)
+		return nil // Don't try to install a package that failed to build
+	}
+	if packagePath == "" {
+		fmt.Printf("Warning: build succeeded but no package path returned for %s (skipping installation)\n", dep)
+		return nil
 	}
 	return s.installBuildDependency(dep, packagePath)
 }
@@ -958,9 +1022,12 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 		version = "0"
 	}
 
-	// Use external install script to avoid shell escaping issues
+	// Use inline install commands instead of external script to avoid hardcoded paths
 	installCommands := []string{
-		"PKGDIR={{pkgdir}} bash /tmp/install-script.sh",
+		"if [ -f build/cmake_install.cmake ]; then DESTDIR={{pkgdir}} cmake --install build; " +
+			"elif [ -f build/meson-private/coredata.dat ]; then DESTDIR={{pkgdir}} meson install -C build; " +
+			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make DESTDIR={{pkgdir}} PREFIX=/usr install; " +
+			"else mkdir -p {{pkgdir}}/usr/bin {{pkgdir}}/usr/lib {{pkgdir}}/usr/include; fi",
 	}
 
 	return &recipe.Recipe{
@@ -974,8 +1041,8 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 		Build: []string{
 			"if [ ! -f configure ] && [ -f autogen.sh ]; then sh ./autogen.sh --no-check ${ZSVO_AUTOGEN_ARGS}; fi; if [ -f configure ]; then ./configure --prefix=/usr ${ZSVO_CONFIGURE_FLAGS}; fi",
 			"# Download missing dependencies automatically",
-			"if [ ! -f \"src/3rdparty/yyjson/yyjson.c\" ]; then echo \"Downloading yyjson...\" && mkdir -p src/3rdparty/yyjson && curl -L https://raw.githubusercontent.com/yyjson/yyjson.c/master/src/yyjson.c -o src/3rdparty/yyjson/yyjson.c; fi",
-			"if [ ! -f \"src/3rdparty/yyjson/yyjson.h\" ]; then echo \"Downloading yyjson header...\" && mkdir -p src/3rdparty/yyjson && curl -L https://raw.githubusercontent.com/yyjson/yyjson.c/master/src/yyjson.h -o src/3rdparty/yyjson/yyjson.h; fi",
+			"if [ ! -f \"src/3rdparty/yyjson/yyjson.c\" ]; then echo \"Downloading yyjson...\" && mkdir -p src/3rdparty/yyjson && curl -L https://raw.githubusercontent.com/ibireme/yyjson/master/src/yyjson.c -o src/3rdparty/yyjson/yyjson.c; fi",
+			"if [ ! -f \"src/3rdparty/yyjson/yyjson.h\" ]; then echo \"Downloading yyjson header...\" && mkdir -p src/3rdparty/yyjson && curl -L https://raw.githubusercontent.com/ibireme/yyjson/master/src/yyjson.h -o src/3rdparty/yyjson/yyjson.h; fi",
 			"if [ -f CMakeLists.txt ]; then cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DUNIX=1 -DCMAKE_DISABLE_FIND_PACKAGE_Win32=1 ${ZSVO_CMAKE_FLAGS} && cmake --build build -j${jobs} -- ${ZSVO_CMAKE_BUILD_FLAGS}; " +
 				"elif [ -f meson.build ]; then meson setup build --prefix=/usr ${ZSVO_MESON_SETUP_ARGS} && meson compile -C build -j${jobs} ${ZSVO_MESON_COMPILE_ARGS}; " +
 				"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make -j${jobs} ${ZSVO_MAKE_FLAGS}; fi",

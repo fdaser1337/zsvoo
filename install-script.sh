@@ -2,7 +2,13 @@
 # Simple install script for auto-generated packages
 set -e
 
-PKGDIR="$1"
+# Use PKGDIR from environment, fallback to first argument for backward compatibility
+PKGDIR="${PKGDIR:-$1}"
+
+if [ -z "$PKGDIR" ]; then
+    echo "Error: PKGDIR not set. Usage: PKGDIR=/path/to/dest $0" >&2
+    exit 1
+fi
 
 echo "Installing to $PKGDIR"
 
