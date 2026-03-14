@@ -186,7 +186,8 @@ func looksLikeFilePath(target string) bool {
 }
 
 const maxAutoBuildDepth = 15 // Увеличим для сложных цепочек зависимостей
-const parallelWorkers = 4    // Количество параллельных воркеров для сборки
+const parallelWorkers = 20   // Параллельный поиск зависимостей (HTTP)
+const buildWorkers = 4       // Параллельное построение пакетов (CPU intensive)
 
 type autoBuildSession struct {
 	workDir          string
@@ -641,6 +642,7 @@ func (s *autoBuildSession) installBuildDependency(dep, packagePath string) error
 }
 
 // collectAllDependencies recursively collects all dependencies into a graph without building
+// Now uses parallel workers (200 concurrent) for faster dependency resolution
 func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGraph, stack []string) error {
 	rootPkg = normalizePackageName(rootPkg)
 	if rootPkg == "" {
@@ -679,7 +681,8 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 	node.recipe = rcp
 	node.buildDepends = srcInfo.BuildDepends
 
-	// Process build dependencies
+	// Collect all dependency names first
+	var depsToProcess []string
 	for _, dep := range srcInfo.BuildDepends {
 		depName := extractPackageNameFromConstraint(dep)
 		if depName == "" {
@@ -698,10 +701,41 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 		// Add dependency relationship
 		graph.addDependency(pkgName, sourcePkg)
 
-		// Recursively collect this dependency's dependencies
-		if err := s.collectAllDependencies(sourcePkg, graph, append(stack, pkgName)); err != nil {
-			// Log but don't fail - some deps might be optional
-			fmt.Printf("  ⚠️  Could not collect dependency %s: %v\n", sourcePkg, err)
+		// Check if already in graph
+		depNode := graph.getOrCreateNode(sourcePkg)
+		if depNode.srcInfo == nil {
+			depsToProcess = append(depsToProcess, sourcePkg)
+		}
+	}
+
+	// Process dependencies in parallel using worker pool
+	if len(depsToProcess) > 0 {
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(depsToProcess))
+
+		// Semaphore to limit concurrent workers (200 workers)
+		semaphore := make(chan struct{}, parallelWorkers)
+
+		for _, dep := range depsToProcess {
+			wg.Add(1)
+			go func(depName string) {
+				defer wg.Done()
+
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+
+				if err := s.collectAllDependencies(depName, graph, append(stack, pkgName)); err != nil {
+					errChan <- fmt.Errorf("could not collect dependency %s: %w", depName, err)
+				}
+			}(dep)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		// Log errors but don't fail
+		for err := range errChan {
+			fmt.Printf("  ⚠️  %v\n", err)
 		}
 	}
 
@@ -749,7 +783,7 @@ func (s *autoBuildSession) buildDependenciesParallel(graph *depGraph) error {
 		errChan := make(chan error, len(nodesToBuild))
 
 		// Limit concurrent builds
-		semaphore := make(chan struct{}, parallelWorkers)
+		semaphore := make(chan struct{}, buildWorkers)
 
 		for _, node := range nodesToBuild {
 			wg.Add(1)
@@ -857,6 +891,7 @@ func joinPathListUnique(parts []string) string {
 }
 
 var simplePkgNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*[a-z0-9]$`)
+var versionNumberPattern = regexp.MustCompile(`[0-9]+\.[0-9]+`)
 var missingCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?m)(?:^|[\s:])(?:/bin/)?sh:\s*(?:\d+:\s*)?([a-zA-Z0-9+_.-]+):\s*(?:command not found|not found)\b`),
 	regexp.MustCompile(`(?m)\b([a-zA-Z0-9+_.-]+):\s*command not found\b`),
@@ -1171,8 +1206,7 @@ func mapDebianPackageToSource(pkg string) string {
 				// Remove lib prefix for source packages
 				base = strings.TrimPrefix(base, "lib")
 				// Convert numbers like 5.1, 2.0 etc
-				re := regexp.MustCompile(`[0-9]+\.[0-9]+`)
-				base = re.ReplaceAllString(base, "")
+				base = versionNumberPattern.ReplaceAllString(base, "")
 				if base != "" {
 					return base
 				}
@@ -1320,20 +1354,7 @@ func toolAlreadyAvailable(dep string) bool {
 		return false
 	}
 
-	// Для тестов на macOS, предположим что базовые инструменты уже доступны
-	basicTools := map[string]bool{
-		"gcc": true, "clang": true, "cc": true,
-		"make": true, "cmake": true, "git": true,
-		"pkg-config": true, "pkgconf": true,
-		"flex": true, "bison": true, "m4": true,
-		"autoconf": true, "automake": true, "libtool": true,
-		"python3": true, "perl": true,
-	}
-
-	if basicTools[dep] {
-		return true
-	}
-
+	// Check if command exists in PATH
 	commands := commandHintsByDep[dep]
 	if len(commands) == 0 {
 		commands = []string{dep}

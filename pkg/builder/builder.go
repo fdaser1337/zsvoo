@@ -255,9 +255,6 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 
 	log.Printf("Executing command: %s", command)
 
-	cmd := exec.Command("sh", "-c", command)
-	cmd.Dir = workDir
-	cmd.Env = env
 	if b.quiet {
 		// Create a context with timeout to prevent hanging - use 2 hours for large packages like gcc/llvm
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
@@ -280,7 +277,7 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 	// For non-quiet mode, still set a reasonable timeout - use 2 hours for large packages
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
-	cmd = exec.CommandContext(ctx, "sh", "-c", command)
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = workDir
 	cmd.Env = env
 

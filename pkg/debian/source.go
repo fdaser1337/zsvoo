@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ulikunitz/xz"
@@ -19,8 +22,8 @@ var packageNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 const defaultDebianMirror = "https://deb.debian.org/debian"
 
 var (
-	defaultSuites     = []string{"stable", "testing", "unstable"}
-	defaultComponents = []string{"main", "contrib", "non-free", "non-free-firmware"}
+	defaultSuites     = []string{"stable"} // Только stable для скорости
+	defaultComponents = []string{"main"}   // Только main для скорости
 )
 
 // SourceInfo describes Debian source package coordinates resolved over HTTP.
@@ -37,14 +40,26 @@ type SourceInfo struct {
 }
 
 const maxAutoBuildDepth = 15 // Увеличим для сложных цепочек зависимостей
-const parallelWorkers = 1    // Временно отключаем параллельную сборку (1 воркер = последовательно)
+const parallelWorkers = 20   // Параллельный поиск зависимостей (HTTP запросы)
+const buildWorkers = 4       // Параллельное построение пакетов
+
+// CachedSources holds parsed Sources data for fast lookups
+type CachedSources struct {
+	packages map[string]*sourceRecord // key: package name
+	path     string                   // cache file path
+	mu       sync.RWMutex
+}
 
 // Resolver queries Debian source metadata over HTTP.
 type Resolver struct {
-	client     *http.Client
-	mirrors    []string
-	suites     []string
-	components []string
+	client        *http.Client
+	mirrors       []string
+	suites        []string
+	components    []string
+	cache         map[string]*SourceInfo    // Кеш найденных пакетов
+	cacheMu       sync.RWMutex              // Защита кеша
+	cachedSources map[string]*CachedSources // Кешированные Sources файлы по ключу
+	sourcesMu     sync.RWMutex              // Защита cachedSources map
 }
 
 // ResolverOption customizes resolver behavior.
@@ -87,10 +102,12 @@ func NewResolver(opts ...ResolverOption) *Resolver {
 			},
 		},
 		mirrors: []string{
-			defaultDebianMirror,
+			defaultDebianMirror, // deb.debian.org (CDN)
 		},
-		suites:     append([]string(nil), defaultSuites...),
-		components: append([]string(nil), defaultComponents...),
+		suites:        append([]string(nil), defaultSuites...),
+		components:    append([]string(nil), defaultComponents...),
+		cache:         make(map[string]*SourceInfo),
+		cachedSources: make(map[string]*CachedSources),
 	}
 
 	for _, opt := range opts {
@@ -118,6 +135,14 @@ func (r *Resolver) ResolveSource(pkg string) (*SourceInfo, error) {
 		return nil, fmt.Errorf("invalid package name %q", pkg)
 	}
 
+	// Проверяем кеш
+	r.cacheMu.RLock()
+	if cached, ok := r.cache[pkg]; ok {
+		r.cacheMu.RUnlock()
+		return cached, nil
+	}
+	r.cacheMu.RUnlock()
+
 	fmt.Printf("  [resolver] Looking up %s...\n", pkg)
 	start := time.Now()
 	defer func() {
@@ -136,8 +161,7 @@ func (r *Resolver) ResolveSource(pkg string) (*SourceInfo, error) {
 					continue
 				}
 
-				fmt.Printf("  [resolver] ✓ Found %s in %s/%s/%s\n", pkg, mirror, suite, component)
-				return &SourceInfo{
+				result := &SourceInfo{
 					RequestedPackage: pkg,
 					SourcePackage:    record.Package,
 					DSCURL:           strings.TrimRight(mirror, "/") + "/" + path.Join(record.Directory, record.DSCName),
@@ -147,7 +171,15 @@ func (r *Resolver) ResolveSource(pkg string) (*SourceInfo, error) {
 					Suite:            suite,
 					Component:        component,
 					BuildDepends:     record.BuildDepends,
-				}, nil
+				}
+
+				// Сохраняем в кеш
+				r.cacheMu.Lock()
+				r.cache[pkg] = result
+				r.cacheMu.Unlock()
+
+				fmt.Printf("  [resolver] ✓ Found %s in %s/%s/%s\n", pkg, mirror, suite, component)
+				return result, nil
 			}
 		}
 	}
@@ -170,31 +202,18 @@ type sourceRecord struct {
 }
 
 func (r *Resolver) findPackageInIndex(mirror, suite, component, pkg string) (*sourceRecord, error) {
-	variants := []struct {
-		ext     string
-		decoder func(io.Reader) (io.Reader, error)
-	}{
-		{ext: "xz", decoder: decodeXZ},
-		{ext: "gz", decoder: decodeGzip},
-		{ext: "", decoder: passthrough},
+	// First, ensure Sources file is loaded into memory
+	cached, err := r.loadCachedSources(mirror, suite, component)
+	if err != nil {
+		return nil, err
 	}
 
-	var firstErr error
-	for _, v := range variants {
-		indexURL := buildSourcesURL(mirror, suite, component, v.ext)
-		record, err := r.findInSingleIndex(indexURL, v.decoder, pkg)
-		if err == nil {
-			return record, nil
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
+	// Lookup from in-memory map (O(1) instead of HTTP scan)
+	if rec, found := r.lookupFromCache(pkg, cached); found {
+		return rec, nil
 	}
 
-	if firstErr == nil {
-		firstErr = fmt.Errorf("could not read sources index")
-	}
-	return nil, firstErr
+	return nil, fmt.Errorf("package not found in cache")
 }
 
 func (r *Resolver) findInSingleIndex(indexURL string, decoder func(io.Reader) (io.Reader, error), pkg string) (*sourceRecord, error) {
@@ -389,7 +408,9 @@ func normalizeUpstreamVersion(debianVersion string) string {
 		v = v[idx+1:]
 	}
 
-	if idx := strings.LastIndex(v, "-"); idx > 0 {
+	// Find the last dash that separates upstream version from Debian revision
+	// For versions like "1.0-1-ubuntu1", we want to cut at the first dash to get "1.0"
+	if idx := strings.Index(v, "-"); idx >= 0 {
 		v = v[:idx]
 	}
 
@@ -420,4 +441,216 @@ func normalizeList(in []string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// cacheDir returns the cache directory for zsvo
+func cacheDir() string {
+	if dir := os.Getenv("ZSVO_CACHE"); dir != "" {
+		return dir
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".cache", "zsvo")
+	}
+	return "/var/cache/zsvo"
+}
+
+// ensureCacheDir creates the cache directory if it doesn't exist
+func ensureCacheDir() error {
+	dir := cacheDir()
+	return os.MkdirAll(dir, 0755)
+}
+
+// cachePath returns the path for a cached Sources file
+func (r *Resolver) cachePath(mirror, suite, component string) string {
+	host := strings.ReplaceAll(strings.TrimPrefix(mirror, "https://"), "/", "_")
+	return filepath.Join(cacheDir(), fmt.Sprintf("Sources_%s_%s_%s.xz", host, suite, component))
+}
+
+// cacheKey returns a unique key for mirror/suite/component combination
+func (r *Resolver) cacheKey(mirror, suite, component string) string {
+	return fmt.Sprintf("%s:%s:%s", mirror, suite, component)
+}
+
+// loadCachedSources loads Sources.xz from cache or downloads it if not exists
+func (r *Resolver) loadCachedSources(mirror, suite, component string) (*CachedSources, error) {
+	key := r.cacheKey(mirror, suite, component)
+
+	// Fast path: check if already loaded
+	r.sourcesMu.RLock()
+	if cached, exists := r.cachedSources[key]; exists {
+		r.sourcesMu.RUnlock()
+		return cached, nil
+	}
+	r.sourcesMu.RUnlock()
+
+	// Slow path: load with write lock
+	r.sourcesMu.Lock()
+	defer r.sourcesMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if cached, exists := r.cachedSources[key]; exists {
+		return cached, nil
+	}
+
+	cachePath := r.cachePath(mirror, suite, component)
+	cached := &CachedSources{
+		packages: make(map[string]*sourceRecord),
+		path:     cachePath,
+	}
+
+	// Try to load from disk cache first
+	if _, err := os.Stat(cachePath); err == nil {
+		// File exists on disk, parse it
+		if err := r.parseSourcesFileToCache(cachePath, mirror, cached); err == nil {
+			r.cachedSources[key] = cached
+			return cached, nil
+		}
+	}
+
+	// Download from HTTP
+	url := buildSourcesURL(mirror, suite, component, "xz")
+	if err := r.downloadSources(url, cachePath); err != nil {
+		// Try gz
+		url = buildSourcesURL(mirror, suite, component, "gz")
+		cachePath = strings.TrimSuffix(cachePath, ".xz") + ".gz"
+		if err := r.downloadSources(url, cachePath); err != nil {
+			// Try uncompressed
+			url = buildSourcesURL(mirror, suite, component, "")
+			cachePath = strings.TrimSuffix(cachePath, ".gz")
+			if err := r.downloadSources(url, cachePath); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Parse the downloaded file
+	if err := r.parseSourcesFileToCache(cachePath, mirror, cached); err != nil {
+		return nil, err
+	}
+
+	r.cachedSources[key] = cached
+	return cached, nil
+}
+
+// downloadSources downloads a Sources file from URL to local path
+func (r *Resolver) downloadSources(url, localPath string) error {
+	fmt.Printf("  [resolver] Downloading %s...\n", url)
+	start := time.Now()
+
+	resp, err := r.client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	if err := ensureCacheDir(); err != nil {
+		return err
+	}
+
+	file, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		os.Remove(localPath)
+		return err
+	}
+
+	fmt.Printf("  [resolver] Downloaded in %v\n", time.Since(start))
+	return nil
+}
+
+// parseSourcesFileToCache parses a local Sources file into specific CachedSources instance
+func (r *Resolver) parseSourcesFileToCache(path, mirror string, cached *CachedSources) error {
+	fmt.Printf("  [resolver] Parsing %s...\n", filepath.Base(path))
+	start := time.Now()
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var reader io.Reader = file
+
+	// Decompress if needed
+	if strings.HasSuffix(path, ".xz") {
+		r, err := xz.NewReader(file)
+		if err != nil {
+			return err
+		}
+		reader = r
+	} else if strings.HasSuffix(path, ".gz") {
+		r, err := gzip.NewReader(file)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		reader = r
+	}
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
+	paragraph := make([]string, 0, 32)
+	count := 0
+
+	flush := func() {
+		if len(paragraph) == 0 {
+			return
+		}
+		rec, err := parseSourcesParagraph(paragraph)
+		paragraph = paragraph[:0]
+		if err != nil {
+			return
+		}
+
+		cached.mu.Lock()
+		cached.packages[rec.Package] = &rec
+		// Also index by binary names
+		for _, bin := range rec.Binaries {
+			bin = strings.TrimSpace(strings.ToLower(bin))
+			if bin != "" && bin != rec.Package {
+				cached.packages[bin] = &rec
+			}
+		}
+		cached.mu.Unlock()
+		count++
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			flush()
+			continue
+		}
+		paragraph = append(paragraph, line)
+	}
+
+	flush()
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	cached.path = path
+	fmt.Printf("  [resolver] Parsed %d packages in %v\n", count, time.Since(start))
+	return nil
+}
+
+// lookupFromCache searches for a package in the in-memory cache
+func (r *Resolver) lookupFromCache(pkg string, cached *CachedSources) (*sourceRecord, bool) {
+	cached.mu.RLock()
+	defer cached.mu.RUnlock()
+
+	if rec, ok := cached.packages[pkg]; ok {
+		return rec, true
+	}
+	return nil, false
 }
