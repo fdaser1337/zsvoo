@@ -36,7 +36,6 @@ var InstallCmd = &cobra.Command{
 		}
 		autoSource, _ := cmd.Flags().GetBool("auto-source")
 		autoBuildDeps, _ := cmd.Flags().GetBool("auto-build-deps")
-		autoResolveDeps, _ := cmd.Flags().GetBool("auto-resolve-deps")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 
 		if dryRun {
@@ -47,7 +46,7 @@ var InstallCmd = &cobra.Command{
 			status.PrintInfo(fmt.Sprintf("Work directory: %s", workDir))
 			status.PrintInfo(fmt.Sprintf("Auto-source: %t", autoSource))
 			status.PrintInfo(fmt.Sprintf("Auto-build-deps: %t", autoBuildDeps))
-			status.PrintInfo(fmt.Sprintf("Auto-resolve-deps: %t", autoResolveDeps))
+			status.PrintInfo(fmt.Sprintf("Auto-resolve-deps: enabled (default)"))
 			status.PrintFooter()
 		}
 
@@ -124,21 +123,14 @@ var InstallCmd = &cobra.Command{
 			return nil
 		}
 
-		// Choose installation method based on flags
-		var err error
-		if autoResolveDeps {
-			// Build search paths for dependency resolution
-			searchPaths := []string{
-				filepath.Join(workDir, "packages"),
-				"/var/cache/packages",
-				filepath.Join(rootDir, "var/cache/packages"),
-			}
-
-			err = i.InstallWithAutoResolve(installTargets, searchPaths)
-		} else {
-			err = i.InstallMany(installTargets)
+		// Choose installation method - always use auto-resolve
+		searchPaths := []string{
+			filepath.Join(rootDir, "var", "cache", "packages"),
+			filepath.Join(workDir, "packages"),
+			"/tmp/pkg-work/packages",
 		}
 
+		err := i.InstallWithAutoResolve(installTargets, searchPaths)
 		if err != nil {
 			return fmt.Errorf("failed to install packages: %w", err)
 		}
@@ -153,7 +145,6 @@ func init() {
 	InstallCmd.Flags().StringP("work-dir", "w", "/tmp/pkg-work", "Working directory for source builds")
 	InstallCmd.Flags().Bool("auto-source", true, "Auto-build package names from Debian source")
 	InstallCmd.Flags().Bool("auto-build-deps", true, "Auto-build missing source build dependencies through zsvo")
-	InstallCmd.Flags().Bool("auto-resolve-deps", false, "Automatically resolve and install dependencies from available packages")
 	InstallCmd.Flags().Bool("dry-run", false, "Show what would be done without making changes")
 }
 
@@ -709,14 +700,48 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 		version = "0"
 	}
 
+	// Map package names to binary names for common packages
+	binaryName := name
+	switch name {
+	case "lua5.1":
+		binaryName = "lua"
+	case "python3":
+		binaryName = "python3"
+	case "python3-dev":
+		binaryName = "python3-config"
+	case "gcc":
+		binaryName = "gcc"
+	case "make":
+		binaryName = "make"
+	case "git":
+		binaryName = "git"
+	case "cmake":
+		binaryName = "cmake"
+	case "pkgconf":
+		binaryName = "pkgconf"
+	}
+
+	// More robust install command with proper fallbacks
 	installCmd := fmt.Sprintf(
 		"if [ -f build/cmake_install.cmake ]; then DESTDIR={{pkgdir}} cmake --install build; "+
 			"elif [ -f build/meson-private/coredata.dat ]; then DESTDIR={{pkgdir}} meson install -C build ${ZSVO_MESON_INSTALL_ARGS}; "+
 			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make DESTDIR={{pkgdir}} PREFIX=/usr ${ZSVO_MAKE_INSTALL_FLAGS} install; "+
-			"elif [ -f %s ]; then install -Dm755 %s {{pkgdir}}/usr/bin/%s; fi",
-		name,
-		name,
-		name,
+			"else "+
+			"  # Try to find and install binaries manually "+
+			"  bin_found=false; "+
+			"  for bin_dir in src .; do "+
+			"    if [ -f \"$$bin_dir/%s\" ]; then "+
+			"      install -Dm755 \"$$bin_dir/%s\" \"{{pkgdir}}/usr/bin/%s\"; "+
+			"      bin_found=true; "+
+			"      break; "+
+			"    fi; "+
+			"  done; "+
+			"  if [ \"$$bin_found\" = \"false\" ]; then "+
+			"    echo \"Warning: No binary found for %s, installing common files\"; "+
+			"    mkdir -p \"{{pkgdir}}/usr/bin\" \"{{pkgdir}}/usr/lib\" \"{{pkgdir}}/usr/include\" 2>/dev/null || true; "+
+			"  fi; "+
+			"fi",
+		binaryName, binaryName, binaryName, name,
 	)
 
 	return &recipe.Recipe{
