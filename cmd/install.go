@@ -184,7 +184,7 @@ func looksLikeFilePath(target string) bool {
 		strings.HasSuffix(target, ".zov")
 }
 
-const maxAutoBuildDepth = 3 // Уменьшим для тестов
+const maxAutoBuildDepth = 15 // Увеличим для сложных цепочек зависимостей
 
 type autoBuildSession struct {
 	workDir          string

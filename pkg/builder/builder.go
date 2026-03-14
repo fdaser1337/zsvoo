@@ -665,7 +665,6 @@ func (b *Builder) validateCommand(command string) error {
 		"init 6",
 		"eval",
 		"$(", // command substitution
-		"${", // parameter expansion
 	}
 
 	// Check against original

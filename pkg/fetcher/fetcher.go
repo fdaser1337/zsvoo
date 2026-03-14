@@ -201,8 +201,19 @@ func (f *Fetcher) downloadAndExtractFromDebianDSC(dscURL, dscHash, destDir strin
 			origEntries = append(origEntries, entry)
 		}
 	}
+
+	// If no orig archives found, this might be a Debian-native package
+	// Fall back to the main source tarball (which doesn't have .orig in name)
 	if len(origEntries) == 0 {
-		return fmt.Errorf("debian dsc does not contain upstream orig archive")
+		for _, entry := range entries {
+			if isDebianSourceArchive(entry.Name) {
+				origEntries = append(origEntries, entry)
+			}
+		}
+	}
+
+	if len(origEntries) == 0 {
+		return fmt.Errorf("debian dsc does not contain any recognizable source archive")
 	}
 
 	base, err := neturl.Parse(dscURL)
@@ -312,6 +323,34 @@ func isDebianOrigArchive(name string) bool {
 	return false
 }
 
+func isDebianSourceArchive(name string) bool {
+	// Debian-native packages have .tar.gz or .tar.xz without .orig in the name
+	// e.g., package_1.0.tar.gz (not package_1.0.orig.tar.gz)
+	if isDebianOrigArchive(name) {
+		return false // This is an orig archive, not a native source
+	}
+
+	// Check if it looks like a source tarball (has .tar suffix)
+	if !strings.Contains(name, ".tar") {
+		return false
+	}
+
+	// Exclude .dsc and .debian.tar files
+	if strings.HasSuffix(name, ".dsc") {
+		return false
+	}
+	if strings.Contains(name, ".debian.tar") {
+		return false
+	}
+	if strings.Contains(name, ".diff.") {
+		return false
+	}
+	if strings.Contains(name, ".asc") { // signature files
+		return false
+	}
+
+	return hasTarSuffix(name)
+}
 func hasTarSuffix(s string) bool {
 	if !strings.HasPrefix(s, ".tar") {
 		return false
