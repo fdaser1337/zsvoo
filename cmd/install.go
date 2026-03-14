@@ -1023,10 +1023,18 @@ func autoRecipeFromDebian(src *debian.SourceInfo) *recipe.Recipe {
 	}
 
 	// Use inline install commands instead of external script to avoid hardcoded paths
+	// For legacy Makefiles that don't respect DESTDIR, we need to use PREFIX={{pkgdir}}/usr
 	installCommands := []string{
 		"if [ -f build/cmake_install.cmake ]; then DESTDIR={{pkgdir}} cmake --install build; " +
 			"elif [ -f build/meson-private/coredata.dat ]; then DESTDIR={{pkgdir}} meson install -C build; " +
-			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then make DESTDIR={{pkgdir}} PREFIX=/usr install; " +
+			"elif [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then " +
+			"  # Try DESTDIR first, fall back to PREFIX for legacy Makefiles\n" +
+			"  if make -n DESTDIR={{pkgdir}} PREFIX=/usr install 2>/dev/null | grep -q 'mkdir.*{{pkgdir}}'; then\n" +
+			"    make DESTDIR={{pkgdir}} PREFIX=/usr install;\n" +
+			"  else\n" +
+			"    # Legacy Makefile - use PREFIX directly\n" +
+			"    make PREFIX={{pkgdir}}/usr install;\n" +
+			"  fi; " +
 			"else mkdir -p {{pkgdir}}/usr/bin {{pkgdir}}/usr/lib {{pkgdir}}/usr/include; fi",
 	}
 

@@ -682,7 +682,8 @@ func (b *Builder) validateCommand(command string) error {
 	}
 
 	// Check for suspicious characters that might indicate injection
-	suspiciousChars := []string{"\x00", "\r", "\n", "\t"}
+	// Note: \n (newline) and \t (tab) are valid in shell scripts for multi-line commands
+	suspiciousChars := []string{"\x00", "\r"}
 	for _, char := range suspiciousChars {
 		if strings.Contains(command, char) {
 			return fmt.Errorf("command contains suspicious character: %q", char)
