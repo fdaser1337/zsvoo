@@ -186,8 +186,8 @@ func looksLikeFilePath(target string) bool {
 }
 
 const maxAutoBuildDepth = 15 // Увеличим для сложных цепочек зависимостей
-const parallelWorkers = 20   // Параллельный поиск зависимостей (HTTP)
-const buildWorkers = 4       // Параллельное построение пакетов (CPU intensive)
+const parallelWorkers = 10   // Уменьшили с 200 до 10 - слишком много потоков
+const buildWorkers = 2       // Уменьшили с 4 до 2 - достаточно для CPU intensive задач
 
 type autoBuildSession struct {
 	workDir          string
@@ -679,7 +679,7 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 		var wg sync.WaitGroup
 		errChan := make(chan error, len(depsToProcess))
 
-		// Semaphore to limit concurrent workers (200 workers)
+		// Semaphore to limit concurrent workers (10 workers)
 		semaphore := make(chan struct{}, parallelWorkers)
 
 		for _, dep := range depsToProcess {
