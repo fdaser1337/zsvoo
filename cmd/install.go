@@ -813,6 +813,7 @@ func buildFailureHint(pkgName string, err error) string {
 			hints,
 			fmt.Sprintf("Hint: missing build dependencies detected: %s.", strings.Join(missingDeps, ", ")),
 			"Hint: добавь рецепты для этих пакетов (или алиасы к Debian source), затем повтори `zsvo install`.",
+			"Hint: или используйте готовые пакеты: ./zsvo install --repo-url https://github.com/yourname/zsvo-prebuilt neovim",
 		)
 	}
 	if strings.Contains(text, "on systems using dpkg and apt, try: \"apt-get install package\"") {

@@ -86,12 +86,13 @@ Makefile
 *.deb
 *.rpm
 *.zip
-*..tar.gz
+*.tar.gz
 *.tar.bz2
 *.tar.xz
 
 # Recipes builds
 recipes/*.pkg.tar.*
+recipes/build/
 recipes/dist/
 
 # Allow scripts directory
