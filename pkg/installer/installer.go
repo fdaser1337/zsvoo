@@ -255,6 +255,13 @@ func (i *Installer) installPackageTxNoLock(packagePath, txDir string, installedI
 		return nil, fmt.Errorf("installed infos map cannot be nil")
 	}
 
+	// Validate package file exists and is readable
+	if _, err := os.Stat(packagePath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("package file does not exist: %s", packagePath)
+	} else if err != nil {
+		return nil, fmt.Errorf("cannot access package file %s: %w", packagePath, err)
+	}
+
 	pkgTxDir, err := os.MkdirTemp(txDir, "pkg-")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create package transaction directory: %w", err)
@@ -300,8 +307,20 @@ func (i *Installer) installPackageTxNoLock(packagePath, txDir string, installedI
 			return nil, fmt.Errorf("failed to remove old package %s files: %w", pkgInfo.Name, err)
 		}
 		if err := i.unregisterPackage(pkgInfo.Name); err != nil {
-			_ = i.rollbackRemove(backups)
-			return nil, fmt.Errorf("failed to unregister old package %s: %w", pkgInfo.Name, err)
+			// Attempt to rollback, but aggregate errors
+			var rollbackErrs []string
+			if rbErr := i.rollbackRemove(backups); rbErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Sprintf("rollback error: %v", rbErr))
+			}
+			if rbErr := i.registerPackage(oldInfo); rbErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Sprintf("reregister error: %v", rbErr))
+			}
+
+			errMsg := fmt.Sprintf("failed to unregister old package %s: %v", pkgInfo.Name, err)
+			if len(rollbackErrs) > 0 {
+				errMsg += fmt.Sprintf(" (rollback errors: %s)", strings.Join(rollbackErrs, "; "))
+			}
+			return nil, fmt.Errorf(errMsg)
 		}
 
 		state.replaced = &removeTransactionState{
@@ -314,23 +333,49 @@ func (i *Installer) installPackageTxNoLock(packagePath, txDir string, installedI
 	backupRoot := filepath.Join(pkgTxDir, "new")
 	installedPaths, backups, err := i.installFiles(extractRoot, pkgInfo, backupRoot)
 	if err != nil {
-		_ = i.rollbackInstall(installedPaths, backups)
-		if state.replaced != nil {
-			_ = i.rollbackRemove(state.replaced.backups)
-			_ = i.registerPackage(state.replaced.info)
+		// Attempt rollback with error aggregation
+		var rollbackErrs []string
+		if rbErr := i.rollbackInstall(installedPaths, backups); rbErr != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Sprintf("install rollback error: %v", rbErr))
 		}
-		return nil, fmt.Errorf("failed to install files: %w", err)
+		if state.replaced != nil {
+			if rbErr := i.rollbackRemove(state.replaced.backups); rbErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Sprintf("remove rollback error: %v", rbErr))
+			}
+			if rbErr := i.registerPackage(state.replaced.info); rbErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Sprintf("reregister error: %v", rbErr))
+			}
+		}
+
+		errMsg := fmt.Sprintf("failed to install files: %v", err)
+		if len(rollbackErrs) > 0 {
+			errMsg += fmt.Sprintf(" (rollback errors: %s)", strings.Join(rollbackErrs, "; "))
+		}
+		return nil, fmt.Errorf(errMsg)
 	}
 	state.installedPaths = installedPaths
 	state.newBackups = backups
 
 	if err := i.registerPackage(pkgInfo); err != nil {
-		_ = i.rollbackInstall(installedPaths, backups)
-		if state.replaced != nil {
-			_ = i.rollbackRemove(state.replaced.backups)
-			_ = i.registerPackage(state.replaced.info)
+		// Attempt rollback with error aggregation
+		var rollbackErrs []string
+		if rbErr := i.rollbackInstall(installedPaths, backups); rbErr != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Sprintf("install rollback error: %v", rbErr))
 		}
-		return nil, fmt.Errorf("failed to register package: %w", err)
+		if state.replaced != nil {
+			if rbErr := i.rollbackRemove(state.replaced.backups); rbErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Sprintf("remove rollback error: %v", rbErr))
+			}
+			if rbErr := i.registerPackage(state.replaced.info); rbErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Sprintf("reregister error: %v", rbErr))
+			}
+		}
+
+		errMsg := fmt.Sprintf("failed to register package: %v", err)
+		if len(rollbackErrs) > 0 {
+			errMsg += fmt.Sprintf(" (rollback errors: %s)", strings.Join(rollbackErrs, "; "))
+		}
+		return nil, fmt.Errorf(errMsg)
 	}
 
 	return state, nil
@@ -1274,9 +1319,13 @@ func (i *Installer) withDBLock(exclusive bool, fn func() error) error {
 		lockType = syscall.LOCK_EX
 	}
 	if err := syscall.Flock(int(lockFile.Fd()), lockType); err != nil {
+		lockFile.Close()
 		return fmt.Errorf("failed to lock package database: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer func() {
+		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		lockFile.Close()
+	}()
 
 	return fn()
 }

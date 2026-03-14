@@ -2,6 +2,7 @@ package fetcher
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mholt/archiver/v3"
 	"golang.org/x/sync/errgroup"
@@ -59,8 +61,16 @@ func (f *Fetcher) Download(url, expectedHash string) (string, error) {
 		return "", fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	// Download file
-	resp, err := http.Get(url)
+	// Download file with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to download %s: %w", url, err)
 	}

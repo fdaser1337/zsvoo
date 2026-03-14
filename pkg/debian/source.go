@@ -33,6 +33,7 @@ type SourceInfo struct {
 	UpstreamVersion  string
 	Suite            string
 	Component        string
+	BuildDepends     []string // Build dependencies from DSC file
 }
 
 // Resolver queries Debian source metadata over HTTP.
@@ -126,6 +127,7 @@ func (r *Resolver) ResolveSource(pkg string) (*SourceInfo, error) {
 					UpstreamVersion:  normalizeUpstreamVersion(record.Version),
 					Suite:            suite,
 					Component:        component,
+					BuildDepends:     record.BuildDepends,
 				}, nil
 			}
 		}
@@ -139,12 +141,13 @@ func (r *Resolver) ResolveSource(pkg string) (*SourceInfo, error) {
 }
 
 type sourceRecord struct {
-	Package   string
-	Version   string
-	Directory string
-	DSCName   string
-	DSCSHA256 string
-	Binaries  []string
+	Package      string
+	Version      string
+	Directory    string
+	DSCName      string
+	DSCSHA256    string
+	Binaries     []string
+	BuildDepends []string
 }
 
 func (r *Resolver) findPackageInIndex(mirror, suite, component, pkg string) (*sourceRecord, error) {
@@ -290,12 +293,13 @@ func parseSourcesParagraph(lines []string) (sourceRecord, error) {
 	dir = strings.Trim(strings.TrimSpace(dir), "/")
 
 	return sourceRecord{
-		Package:   pkg,
-		Version:   ver,
-		Directory: dir,
-		DSCName:   dscName,
-		DSCSHA256: dscHash,
-		Binaries:  parseCommaSeparatedField(fields["Binary"]),
+		Package:      pkg,
+		Version:      ver,
+		Directory:    dir,
+		DSCName:      dscName,
+		DSCSHA256:    dscHash,
+		Binaries:     parseCommaSeparatedField(fields["Binary"]),
+		BuildDepends: parseCommaSeparatedField(fields["Build-Depends"]),
 	}, nil
 }
 

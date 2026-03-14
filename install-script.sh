@@ -27,6 +27,6 @@ if [ -f Makefile ] || [ -f makefile ] || [ -f GNUmakefile ]; then
     exit 0
 fi
 
-# Fallback - create minimal structure in PKGDIR
+# Fallback - create minimal structure
 echo "Warning: No standard build system found, installing common directories"
 mkdir -p "$PKGDIR/usr/bin" "$PKGDIR/usr/lib" "$PKGDIR/usr/include"

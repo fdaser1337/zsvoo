@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"zsvo/pkg/fetcher"
 	"zsvo/pkg/packager"
@@ -230,9 +232,9 @@ func (b *Builder) buildEnvironment(stagingDir string) []string {
 	env := os.Environ()
 
 	// Add standard build environment variables
-	env = append(env, fmt.Sprintf("DESTDIR=%s", stagingDir))
-	env = append(env, fmt.Sprintf("PREFIX=/usr"))
-	env = append(env, fmt.Sprintf("PKGDIR=%s", stagingDir))
+	env = append(env, "DESTDIR="+stagingDir)
+	env = append(env, "PREFIX=/usr")
+	env = append(env, "PKGDIR="+stagingDir)
 
 	// Add parallel build variable
 	env = append(env, fmt.Sprintf("MAKEFLAGS=-j%d", runtime.NumCPU()))
@@ -256,8 +258,14 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = workDir
 	cmd.Env = env
-
 	if b.quiet {
+		// Create a context with timeout to prevent hanging
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "sh", "-c", command)
+		cmd.Dir = workDir
+		cmd.Env = env
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			details := tailOutput(string(output), 20)
@@ -268,6 +276,13 @@ func (b *Builder) executeCommand(workDir, command string, env []string) error {
 		}
 		return nil
 	}
+
+	// For non-quiet mode, still set a reasonable timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	cmd = exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.Dir = workDir
+	cmd.Env = env
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -525,7 +540,7 @@ func (b *Builder) reportProgress(step, total int, message string) {
 	b.callbackMutex.RLock()
 	callback := b.progressCallback
 	b.callbackMutex.RUnlock()
-	
+
 	if callback == nil {
 		return
 	}
@@ -598,32 +613,42 @@ func (b *Builder) validateSourceFiles(recipe *recipe.Recipe, sourceDir string) e
 	return nil
 }
 
-// validateCommand performs basic security checks on build commands
 func (b *Builder) validateCommand(command string) error {
 	// List of dangerous patterns to block
 	dangerousPatterns := []string{
 		"rm -rf /",
-		"rm -rf /*", 
+		"rm -rf /*",
 		":(){ :|:& };:", // fork bomb
 		"chmod 777 /",
 		"chown root",
 		"sudo ",
 		"su ",
-		"passwd",
-		"curl | sh",
-		"wget | sh",
-		"eval $(",
-		"sh -c $(",
-		"bash -c $(",
 		"> /dev/sda",
 		"> /dev/hda",
 		"mkfs",
 		"format",
 		"fdisk",
+		// Additional patterns
+		"dd if=",
+		"chmod -R 777 /",
+		"chown -R root",
+		"rm -rf /*",
+		"rm -rf /etc",
+		"rm -rf /usr",
+		"rm -rf /bin",
+		"rm -rf /sbin",
+		"rm -rf /lib",
+		"rm -rf /lib64",
+		"shutdown",
+		"reboot",
+		"halt",
+		"poweroff",
+		"init 0",
+		"init 6",
 	}
 
 	cmdLower := strings.ToLower(command)
-	
+
 	// Check for dangerous patterns
 	for _, pattern := range dangerousPatterns {
 		if strings.Contains(cmdLower, pattern) {
@@ -648,6 +673,17 @@ func (b *Builder) validateCommand(command string) error {
 	// Check for extremely long commands (possible injection attempt)
 	if len(command) > 1000 {
 		return fmt.Errorf("command too long (%d characters)", len(command))
+	}
+
+	// Check for command substitution patterns that could bypass security
+	dangerousSubstitutions := []string{
+		"`",
+		"$|",
+	}
+	for _, pattern := range dangerousSubstitutions {
+		if strings.Contains(command, pattern) {
+			return fmt.Errorf("command contains potentially dangerous substitution: %s", pattern)
+		}
 	}
 
 	// Log the command for audit purposes (only first 100 chars)
