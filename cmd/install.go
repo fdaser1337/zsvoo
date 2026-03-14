@@ -10,13 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"zsvo/pkg/builder"
 	"zsvo/pkg/debian"
-	"zsvo/pkg/installer"
 	"zsvo/pkg/i18n"
+	"zsvo/pkg/installer"
 	"zsvo/pkg/recipe"
 	"zsvo/pkg/ui"
+
+	"github.com/spf13/cobra"
 )
 
 var InstallCmd = &cobra.Command{
@@ -132,7 +133,7 @@ var InstallCmd = &cobra.Command{
 				"/var/cache/packages",
 				filepath.Join(rootDir, "var/cache/packages"),
 			}
-			
+
 			err = i.InstallWithAutoResolve(installTargets, searchPaths)
 		} else {
 			err = i.InstallMany(installTargets)
@@ -142,7 +143,7 @@ var InstallCmd = &cobra.Command{
 			return fmt.Errorf("failed to install packages: %w", err)
 		}
 
-		fmt.Printf(i18n.T("Package installation completed successfully")+"\n")
+		fmt.Printf(i18n.T("Package installation completed successfully") + "\n")
 		return nil
 	},
 }
@@ -433,7 +434,7 @@ func joinPathListUnique(parts []string) string {
 	return strings.Join(out, string(os.PathListSeparator))
 }
 
-var simplePkgNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
+var simplePkgNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*[a-z0-9]$`)
 var missingCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?m)(?:^|[\s:])(?:/bin/)?sh:\s*(?:\d+:\s*)?([a-zA-Z0-9+_.-]+):\s*(?:command not found|not found)\b`),
 	regexp.MustCompile(`(?m)\b([a-zA-Z0-9+_.-]+):\s*command not found\b`),
@@ -475,15 +476,55 @@ func inferMissingBuildDeps(err error) []string {
 		found["gcc"] = struct{}{}
 	}
 
-	// Detect missing source files
-	if strings.Contains(lowerText, "cannot find source file") ||
-		strings.Contains(lowerText, "no sources given to target") ||
-		strings.Contains(lowerText, "cmake generate step failed") {
+	// Detect missing CMake
+	if strings.Contains(lowerText, "cmake") &&
+		(strings.Contains(lowerText, "not found") ||
+			strings.Contains(lowerText, "command not found") ||
+			strings.Contains(lowerText, "cmake: command not found") ||
+			strings.Contains(lowerText, "cmake command not found") ||
+			strings.Contains(lowerText, "no cmake") ||
+			strings.Contains(lowerText, "could not find cmake")) {
 		found["cmake"] = struct{}{}
 	}
 
-	// Detect missing submodules/sources
-	if strings.Contains(lowerText, "yyjson.c") || strings.Contains(lowerText, "3rdparty") {
+	// Detect missing Git
+	if strings.Contains(lowerText, "git") &&
+		(strings.Contains(lowerText, "not found") ||
+			strings.Contains(lowerText, "command not found") ||
+			strings.Contains(lowerText, "git: command not found") ||
+			strings.Contains(lowerText, "git command not found") ||
+			strings.Contains(lowerText, "no git") ||
+			strings.Contains(lowerText, "could not find git")) {
+		found["git"] = struct{}{}
+	}
+
+	// Detect missing make
+	if strings.Contains(lowerText, "make") &&
+		(strings.Contains(lowerText, "not found") ||
+			strings.Contains(lowerText, "command not found") ||
+			strings.Contains(lowerText, "make: command not found") ||
+			strings.Contains(lowerText, "make command not found") ||
+			strings.Contains(lowerText, "no make") ||
+			strings.Contains(lowerText, "could not find make")) {
+		found["make"] = struct{}{}
+	}
+
+	// Detect missing source files and CMake errors
+	if strings.Contains(lowerText, "cannot find source file") ||
+		strings.Contains(lowerText, "no sources given to target") ||
+		strings.Contains(lowerText, "cmake generate step failed") ||
+		strings.Contains(lowerText, "cmake error") ||
+		strings.Contains(lowerText, "could not load cache") {
+		found["cmake"] = struct{}{}
+	}
+
+	// Detect missing submodules/sources (git issues)
+	if strings.Contains(lowerText, "yyjson.c") ||
+		strings.Contains(lowerText, "3rdparty") ||
+		strings.Contains(lowerText, "submodule") ||
+		strings.Contains(lowerText, "git submodule") ||
+		strings.Contains(lowerText, "fatal: not a git repository") ||
+		strings.Contains(lowerText, "not a git repository") {
 		found["git"] = struct{}{}
 	}
 
@@ -501,9 +542,26 @@ func inferMissingBuildDeps(err error) []string {
 
 func mapToolToSourcePackage(tool string) string {
 	tool = normalizePackageName(tool)
-	if tool == "" || allDigits(tool) {
+	if tool == "" || allDigits(tool) || len(tool) < 2 {
 		return ""
 	}
+
+	// Filter out common words that are not package names
+	commonWords := map[string]bool{
+		"was": true, "the": true, "and": true, "for": true, "are": true,
+		"but": true, "not": true, "you": true, "all": true, "can": true,
+		"had": true, "her": true, "one": true, "our": true,
+		"out": true, "day": true, "get": true, "has": true, "him": true,
+		"his": true, "how": true, "man": true, "new": true, "now": true,
+		"old": true, "see": true, "two": true, "way": true, "who": true,
+		"its": true, "did": true, "yes": true, "she": true, "may": true,
+		"why": true, "try": true, "use": true,
+	}
+
+	if commonWords[tool] {
+		return ""
+	}
+
 	switch tool {
 	case "sh", "bash", "dash", "zsh":
 		return ""
@@ -512,6 +570,8 @@ func mapToolToSourcePackage(tool string) string {
 	case "ninja":
 		return "ninja-build"
 	case "python":
+		return "python3"
+	case "python3":
 		return "python3"
 	case "lua":
 		return "lua5.1"
@@ -525,6 +585,70 @@ func mapToolToSourcePackage(tool string) string {
 		return "xz-utils"
 	case "git":
 		return "git"
+	case "cmake":
+		return "cmake"
+	case "make":
+		return "make"
+	case "autoconf":
+		return "autoconf"
+	case "automake":
+		return "automake"
+	case "libtool":
+		return "libtool"
+	case "pkgconf":
+		return "pkgconf"
+	case "flex":
+		return "flex"
+	case "bison":
+		return "bison"
+	case "m4":
+		return "m4"
+	case "gettext":
+		return "gettext"
+	case "libssl-dev":
+		return "libssl-dev"
+	case "libcrypto-dev":
+		return "libssl-dev"
+	case "zlib1g-dev":
+		return "zlib1g-dev"
+	case "libpng-dev":
+		return "libpng-dev"
+	case "libjpeg-dev":
+		return "libjpeg-dev"
+	case "libxml2-dev":
+		return "libxml2-dev"
+	case "libcurl4-openssl-dev":
+		return "libcurl4-openssl-dev"
+	case "libffi-dev":
+		return "libffi-dev"
+	case "libreadline-dev":
+		return "libreadline-dev"
+	case "libncurses-dev":
+		return "libncurses-dev"
+	case "libsqlite3-dev":
+		return "libsqlite3-dev"
+	case "libbz2-dev":
+		return "libbz2-dev"
+	case "liblzma-dev":
+		return "liblzma-dev"
+	case "libiconv":
+		return "libiconv"
+	case "libintl":
+		return "gettext"
+	case "libuuid-dev":
+		return "libuuid-dev"
+	case "libexpat1-dev":
+		return "libexpat1-dev"
+	case "libpcre3-dev":
+		return "libpcre3-dev"
+	case "libpcre2-dev":
+		return "libpcre2-dev"
+	case "libgcrypt20-dev":
+		return "libgcrypt20-dev"
+	case "libgpg-error-dev":
+		return "libgpg-error-dev"
+	case "libgnutls28-dev":
+		return "libgnutls28-dev"
 	}
 
 	if !simplePkgNamePattern.MatchString(tool) {

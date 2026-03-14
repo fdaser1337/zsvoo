@@ -1,0 +1,16 @@
+name: git
+version: 2.43.0
+description: Git is a fast, scalable, distributed revision control system
+source:
+  debian_dsc: https://deb.debian.org/debian/pool/main/g/git/git_2.43.0-1.dsc
+build:
+  - make configure
+  - ./configure --prefix=/usr --with-curl --with-openssl
+  - make -j$(nproc) all
+install:
+  - make install DESTDIR=/usr
+package:
+  name: git
+  version: 2.43.0
+  arch: any
+  description: Fast, scalable, distributed revision control system

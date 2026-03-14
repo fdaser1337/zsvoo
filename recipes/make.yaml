@@ -1,0 +1,15 @@
+name: make
+version: 4.4.1
+description: GNU Make is a tool which controls the generation of executables and other non-source files
+source:
+  debian_dsc: https://deb.debian.org/debian/pool/main/m/make-dfsg/make-dfsg_4.4.1-1.dsc
+build:
+  - ./configure --prefix=/usr
+  - make -j$(nproc)
+install:
+  - make install DESTDIR=/usr
+package:
+  name: make
+  version: 4.4.1
+  arch: any
+  description: GNU Make utility to control compilation

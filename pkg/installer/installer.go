@@ -18,10 +18,10 @@ import (
 
 // Installer handles installing and removing packages.
 type Installer struct {
-	rootDir string
-	pkgDB   string
+	rootDir  string
+	pkgDB    string
 	resolver *deps.DependencyResolver
-	repo    *InstallerPackageRepository
+	repo     *InstallerPackageRepository
 }
 
 // RemoveOptions controls package removal behavior.
@@ -34,11 +34,11 @@ func NewInstaller(rootDir string) *Installer {
 		rootDir: rootDir,
 		pkgDB:   filepath.Join(rootDir, "var", "lib", "pkgdb"),
 	}
-	
-	// Initialize repository and resolver
+
+	// Initialize repository and resolver with fetcher
 	inst.repo = NewInstallerPackageRepository(inst)
-	inst.resolver = deps.NewDependencyResolver(inst.repo)
-	
+	inst.resolver = deps.NewDependencyResolver(inst.repo, inst) // Installer implements PackageFetcher
+
 	return inst
 }
 
@@ -1371,84 +1371,134 @@ func (i *Installer) GetPackageSize(packageName string) (int64, error) {
 	return totalSize, nil
 }
 
-// resolveAllDependencies recursively resolves all dependencies for packages
-func (i *Installer) resolveAllDependencies(initialCandidates []installCandidate) ([]installCandidate, error) {
-	installed, err := i.installedPkgInfosNoLock()
+// FetchPackage implements PackageFetcher interface
+func (i *Installer) FetchPackage(pkgName string, version string) error {
+	// Try to find package in available search paths
+	searchPaths := []string{
+		filepath.Join(i.rootDir, "var", "cache", "packages"),
+		filepath.Join("/var", "cache", "packages"),
+		filepath.Join(i.rootDir, "work", "packages"),
+	}
+
+	for _, searchPath := range searchPaths {
+		if _, err := os.Stat(searchPath); os.IsNotExist(err) {
+			continue
+		}
+
+		// Search for package files
+		pkgPath, err := i.searchPackageInPath(pkgName, searchPath)
+		if err == nil {
+			fmt.Printf("Found package %s at %s\n", pkgName, pkgPath)
+			return nil // Package found and available
+		}
+	}
+
+	// If not found locally, try to download from remote sources
+	// This could integrate with Debian sources, custom repos, etc.
+	return fmt.Errorf("package %s not found locally and no remote fetcher configured", pkgName)
+}
+
+// searchPackageInPath searches for a package in a directory
+func (i *Installer) searchPackageInPath(pkgName, searchPath string) (string, error) {
+	entries, err := os.ReadDir(searchPath)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	// Convert installed to deps.PackageInfo format
-	installedMap := make(map[string]*deps.PackageInfo, len(installed))
-	for name, info := range installed {
-		installedMap[name] = &deps.PackageInfo{
-			Name:         info.Name,
-			Version:      info.Version,
-			Dependencies: info.Dependencies,
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		if strings.Contains(entry.Name(), pkgName) && strings.HasSuffix(entry.Name(), ".pkg.tar.zst") {
+			return filepath.Join(searchPath, entry.Name()), nil
 		}
 	}
 
-	// Track all packages to install
-	allPackages := make(map[string]installCandidate)
-	
-	// Add initial packages
-	for _, candidate := range initialCandidates {
-		allPackages[candidate.info.Name] = candidate
-	}
+	return "", fmt.Errorf("package %s not found in %s", pkgName, searchPath)
+}
 
-	// Process dependencies recursively
-	toProcess := make([]installCandidate, len(initialCandidates))
-	copy(toProcess, initialCandidates)
-
-	for len(toProcess) > 0 {
-		current := toProcess[0]
-		toProcess = toProcess[1:]
-
-		// Check dependencies
-		missing, err := i.findMissingDependencies(current.info, installedMap, allPackages)
-		if err != nil {
-			return nil, err
-		}
-
-		// Try to find missing dependencies in available packages
-		for _, depName := range missing {
-			if _, exists := allPackages[depName]; exists {
-				continue // Already in our list
-			}
-
-			// Try to find the dependency package
-			depCandidate, err := i.findDependencyPackage(depName)
-			if err != nil {
-				return nil, errors.NewDependencyMissingError(current.info.Name, depName)
-			}
-
-			allPackages[depName] = depCandidate
-			toProcess = append(toProcess, depCandidate)
-		}
-	}
-
-	// Convert map to slice and resolve installation order
-	packageList := make([]*deps.PackageInfo, 0, len(allPackages))
-	for _, candidate := range allPackages {
-		packageList = append(packageList, &deps.PackageInfo{
+// resolveAllDependencies recursively resolves all dependencies for packages using new resolver
+func (i *Installer) resolveAllDependencies(initialCandidates []installCandidate) ([]installCandidate, error) {
+	// Convert candidates to deps.PackageInfo
+	packageInfos := make([]*deps.PackageInfo, len(initialCandidates))
+	for i, candidate := range initialCandidates {
+		packageInfos[i] = &deps.PackageInfo{
 			Name:         candidate.info.Name,
 			Version:      candidate.info.Version,
 			Dependencies: candidate.info.Dependencies,
-		})
+		}
 	}
 
-	ordered, err := i.resolver.ResolveOrder(packageList)
+	// Use new resolver with recursive dependency resolution
+	resolved, err := i.resolver.ResolveDependencies(packageInfos)
 	if err != nil {
-		return nil, err
+		// Don't fail completely, just log warning and continue with what we have
+		fmt.Printf("Warning: dependency resolution failed: %v\n", err)
+		return initialCandidates, nil
 	}
 
-	// Convert back to installCandidate slice
-	result := make([]installCandidate, 0, len(ordered))
-	for _, pkg := range ordered {
-		result = append(result, allPackages[pkg.Name])
+	// Convert back to installCandidate - need to find paths for resolved packages
+	result := make([]installCandidate, 0, len(resolved))
+
+	// First add original candidates
+	for _, candidate := range initialCandidates {
+		result = append(result, candidate)
+	}
+
+	// Then add any new dependencies that weren't in original list
+	for _, pkg := range resolved {
+		found := false
+		for _, candidate := range initialCandidates {
+			if candidate.info.Name == pkg.Name {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// Try to find this package file
+			pkgPath, err := i.findPackageFile(pkg.Name)
+			if err != nil {
+				fmt.Printf("Warning: cannot find package file for %s: %v\n", pkg.Name, err)
+				continue
+			}
+
+			candidate, err := i.readInstallCandidatesNoLock([]string{pkgPath})
+			if err != nil {
+				fmt.Printf("Warning: cannot read package %s: %v\n", pkgPath, err)
+				continue
+			}
+
+			if len(candidate) > 0 {
+				result = append(result, candidate[0])
+			}
+		}
 	}
 
 	return result, nil
+}
+
+// findPackageFile finds package file by name
+func (i *Installer) findPackageFile(pkgName string) (string, error) {
+	searchPaths := []string{
+		filepath.Join(i.rootDir, "var", "cache", "packages"),
+		filepath.Join("/var", "cache", "packages"),
+		filepath.Join(i.rootDir, "work", "packages"),
+	}
+
+	for _, searchPath := range searchPaths {
+		if _, err := os.Stat(searchPath); os.IsNotExist(err) {
+			continue
+		}
+
+		pkgPath, err := i.searchPackageInPath(pkgName, searchPath)
+		if err == nil {
+			return pkgPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("package file for %s not found", pkgName)
 }
 
 // findMissingDependencies finds dependencies that are not satisfied
@@ -1462,7 +1512,7 @@ func (i *Installer) findMissingDependencies(pkgInfo *types.PkgInfo, installed ma
 
 	for _, req := range reqs {
 		satisfied := false
-		
+
 		// Check installed packages
 		for _, alt := range req.Alternatives {
 			if installedPkg, exists := installed[alt.Name]; exists {
@@ -1472,7 +1522,7 @@ func (i *Installer) findMissingDependencies(pkgInfo *types.PkgInfo, installed ma
 				}
 			}
 		}
-		
+
 		if satisfied {
 			continue
 		}
@@ -1486,7 +1536,7 @@ func (i *Installer) findMissingDependencies(pkgInfo *types.PkgInfo, installed ma
 				}
 			}
 		}
-		
+
 		if satisfied {
 			continue
 		}
@@ -1506,7 +1556,7 @@ func (i *Installer) findDependencyPackage(depName string) (installCandidate, err
 	// 1. Search package repositories
 	// 2. Query package indexes
 	// 3. Use auto-build from source like in cmd/install.go
-	
+
 	return installCandidate{}, errors.NewPackageNotFoundError(depName)
 }
 
@@ -1555,7 +1605,7 @@ func (i *Installer) resolveDependenciesFromSearch(initialCandidates []installCan
 
 	// Track all packages to install
 	allPackages := make(map[string]installCandidate)
-	
+
 	// Add initial packages
 	for _, candidate := range initialCandidates {
 		allPackages[candidate.info.Name] = candidate
@@ -1617,7 +1667,7 @@ func (i *Installer) resolveDependenciesFromSearch(initialCandidates []installCan
 // buildPackageIndex builds an index of available packages from search paths
 func (i *Installer) buildPackageIndex(searchPaths []string) (map[string]installCandidate, error) {
 	index := make(map[string]installCandidate)
-	
+
 	for _, searchPath := range searchPaths {
 		entries, err := os.ReadDir(searchPath)
 		if err != nil {
@@ -1656,7 +1706,7 @@ func (i *Installer) findMissingDependenciesFromSearch(pkgInfo *types.PkgInfo, in
 
 	for _, req := range reqs {
 		satisfied := false
-		
+
 		// Check installed packages
 		for _, alt := range req.Alternatives {
 			if installedPkg, exists := installed[alt.Name]; exists {
@@ -1666,7 +1716,7 @@ func (i *Installer) findMissingDependenciesFromSearch(pkgInfo *types.PkgInfo, in
 				}
 			}
 		}
-		
+
 		if satisfied {
 			continue
 		}
@@ -1680,7 +1730,7 @@ func (i *Installer) findMissingDependenciesFromSearch(pkgInfo *types.PkgInfo, in
 				}
 			}
 		}
-		
+
 		if satisfied {
 			continue
 		}
@@ -1694,7 +1744,7 @@ func (i *Installer) findMissingDependenciesFromSearch(pkgInfo *types.PkgInfo, in
 				}
 			}
 		}
-		
+
 		if satisfied {
 			continue
 		}

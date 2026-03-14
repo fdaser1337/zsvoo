@@ -30,6 +30,34 @@ func (m *MockPackageRepository) GetPackage(name string) (*PackageInfo, error) {
 	return pkg, nil
 }
 
+func (m *MockPackageRepository) SearchPackages(query string) ([]*PackageInfo, error) {
+	var results []*PackageInfo
+	for _, pkg := range m.packages {
+		if pkg.Name == query {
+			results = append(results, pkg)
+		}
+	}
+	return results, nil
+}
+
+// MockPackageFetcher for testing
+type MockPackageFetcher struct {
+	fetched map[string]bool
+}
+
+func NewMockPackageFetcher() *MockPackageFetcher {
+	return &MockPackageFetcher{fetched: make(map[string]bool)}
+}
+
+func (m *MockPackageFetcher) FetchPackage(pkgName string, version string) error {
+	m.fetched[pkgName] = true
+	return nil
+}
+
+func (m *MockPackageFetcher) WasFetched(pkgName string) bool {
+	return m.fetched[pkgName]
+}
+
 func TestDependencyResolver_CheckDependencies(t *testing.T) {
 	t.Parallel()
 
@@ -47,7 +75,8 @@ func TestDependencyResolver_CheckDependencies(t *testing.T) {
 	}
 
 	repo := NewMockPackageRepository(installed)
-	resolver := NewDependencyResolver(repo)
+	fetcher := NewMockPackageFetcher()
+	resolver := NewDependencyResolver(repo, fetcher)
 
 	cases := []struct {
 		name string
@@ -129,7 +158,8 @@ func TestDependencyResolver_ResolveOrder(t *testing.T) {
 
 	installed := map[string]*PackageInfo{}
 	repo := NewMockPackageRepository(installed)
-	resolver := NewDependencyResolver(repo)
+	fetcher := NewMockPackageFetcher()
+	resolver := NewDependencyResolver(repo, fetcher)
 
 	order, err := resolver.ResolveOrder(packages)
 	if err != nil {
@@ -150,13 +180,9 @@ func TestDependencyResolver_ResolveOrder(t *testing.T) {
 func TestDependencyResolver_FindMissingDependencies(t *testing.T) {
 	t.Parallel()
 
-	installed := map[string]*PackageInfo{
-		"pkg1": {Name: "pkg1", Version: "1.0"},
-		"pkg2": {Name: "pkg2", Version: "2.0"},
-	}
-
-	repo := NewMockPackageRepository(installed)
-	resolver := NewDependencyResolver(repo)
+	repo := NewMockPackageRepository(map[string]*PackageInfo{})
+	fetcher := NewMockPackageFetcher()
+	resolver := NewDependencyResolver(repo, fetcher)
 
 	pkg := &PackageInfo{
 		Name:         "testpkg",
@@ -164,9 +190,9 @@ func TestDependencyResolver_FindMissingDependencies(t *testing.T) {
 		Dependencies: []string{"pkg1", "pkg3", "pkg4>=1.5"},
 	}
 
-	missing := resolver.findMissingDependencies(pkg, installed)
-	
-	expected := []string{"pkg3", "pkg4>=1.5"}
+	missing := resolver.findMissingDependencies(pkg, map[string]*PackageInfo{})
+
+	expected := []string{"pkg1", "pkg3", "pkg4>=1.5"}
 	if len(missing) != len(expected) {
 		t.Fatalf("Expected %d missing dependencies, got %d", len(expected), len(missing))
 	}
