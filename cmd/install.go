@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -40,7 +41,7 @@ var InstallCmd = &cobra.Command{
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		jobs, _ := cmd.Flags().GetInt("jobs")
 		if jobs < 1 {
-			jobs = 1 // Default to single job to prevent overheating
+			jobs = runtime.NumCPU() // Use all CPU cores for maximum speed
 		}
 		cooldown, _ := cmd.Flags().GetDuration("cooldown")
 
@@ -142,8 +143,8 @@ func init() {
 	InstallCmd.Flags().Bool("auto-source", true, "Auto-build package names from Debian source")
 	InstallCmd.Flags().Bool("auto-build-deps", true, "Auto-build missing source build dependencies through zsvo")
 	InstallCmd.Flags().Bool("dry-run", false, "Show what would be done without making changes")
-	InstallCmd.Flags().IntP("jobs", "j", 1, "Number of parallel build jobs (default: 1 to prevent overheating)")
-	InstallCmd.Flags().Duration("cooldown", 5*time.Second, "Cooldown period between package builds (default: 5s)")
+	InstallCmd.Flags().IntP("jobs", "j", runtime.NumCPU(), "Number of parallel build jobs (default: all CPU cores)")
+	InstallCmd.Flags().Duration("cooldown", 0, "Cooldown period between package builds (default: 0s for max speed)")
 }
 
 func isInstallFileTarget(target string) (bool, error) {
