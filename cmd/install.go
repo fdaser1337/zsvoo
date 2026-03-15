@@ -38,17 +38,22 @@ var InstallCmd = &cobra.Command{
 		autoSource, _ := cmd.Flags().GetBool("auto-source")
 		autoBuildDeps, _ := cmd.Flags().GetBool("auto-build-deps")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		jobs, _ := cmd.Flags().GetInt("jobs")
+		if jobs < 1 {
+			jobs = 1 // Default to single job to prevent overheating
+		}
+		cooldown, _ := cmd.Flags().GetDuration("cooldown")
+
+		pui := ui.NewPacmanUI(false)
 
 		if dryRun {
-			status := ui.NewStatusBar("", 1)
-			status.SetTheme("neon")
-			status.PrintHeader("DRY RUN MODE")
-			status.PrintInfo(fmt.Sprintf("Root directory: %s", rootDir))
-			status.PrintInfo(fmt.Sprintf("Work directory: %s", workDir))
-			status.PrintInfo(fmt.Sprintf("Auto-source: %t", autoSource))
-			status.PrintInfo(fmt.Sprintf("Auto-build-deps: %t", autoBuildDeps))
-			status.PrintInfo("Auto-resolve-deps: enabled (default)")
-			status.PrintFooter()
+			pui.PrintInfo("DRY RUN MODE")
+			pui.PrintInfo(fmt.Sprintf("Root directory: %s", rootDir))
+			pui.PrintInfo(fmt.Sprintf("Work directory: %s", workDir))
+			pui.PrintInfo(fmt.Sprintf("Auto-source: %t", autoSource))
+			pui.PrintInfo(fmt.Sprintf("Auto-build-deps: %t", autoBuildDeps))
+			pui.PrintInfo(fmt.Sprintf("Parallel jobs: %d", jobs))
+			pui.PrintInfo(fmt.Sprintf("Cooldown: %v", cooldown))
 		}
 
 		installTargets := make([]string, 0, len(args))
@@ -56,7 +61,7 @@ var InstallCmd = &cobra.Command{
 
 		var session *autoBuildSession
 		if autoSource {
-			session = newAutoBuildSession(workDir, autoBuildDeps)
+			session = newAutoBuildSession(workDir, autoBuildDeps, jobs, cooldown)
 		}
 
 		for _, target := range args {
@@ -67,9 +72,8 @@ var InstallCmd = &cobra.Command{
 
 			if isFile {
 				if dryRun {
-					status := ui.NewStatusBar("", 1)
-					status.SetTheme("neon")
-					status.PrintInfo(fmt.Sprintf(i18n.T("would_install_file"), target))
+					pui := ui.NewPacmanUI(false)
+					pui.PrintInfo(fmt.Sprintf(i18n.T("would_install_file"), target))
 				}
 				installTargets = append(installTargets, target)
 				continue
@@ -83,10 +87,8 @@ var InstallCmd = &cobra.Command{
 			}
 
 			if dryRun {
-				status := ui.NewStatusBar("", 1)
-				status.SetTheme("neon")
-				status.PrintInfo(fmt.Sprintf(i18n.T("would_auto_build"), target))
-				installTargets = append(installTargets, target) // для демонстрации
+				pui.PrintInfo(fmt.Sprintf(i18n.T("would_auto_build"), target))
+				installTargets = append(installTargets, target)
 				continue
 			}
 
@@ -99,28 +101,21 @@ var InstallCmd = &cobra.Command{
 
 		if len(installTargets) == 1 {
 			if dryRun {
-				status := ui.NewStatusBar("", 1)
-				status.SetTheme("neon")
-				status.PrintInfo(i18n.T("would_install_one"))
+				pui.PrintInfo(i18n.T("would_install_one"))
 			} else {
-				fmt.Printf(i18n.T("installing_one")+"\n", installTargets[0])
+				pui.PrintOperation("installing", installTargets[0])
 			}
 		} else {
 			if dryRun {
-				status := ui.NewStatusBar("", 1)
-				status.SetTheme("neon")
-				status.PrintInfo(fmt.Sprintf(i18n.T("would_install_many"), len(installTargets)))
+				pui.PrintInfo(fmt.Sprintf(i18n.T("would_install_many"), len(installTargets)))
 			} else {
-				fmt.Printf(i18n.T("installing_many")+"\n", len(installTargets))
+				pui.PrintOperation("installing", fmt.Sprintf("%d packages", len(installTargets)))
 			}
 		}
 
 		if dryRun {
-			status := ui.NewStatusBar("", 1)
-			status.SetTheme("neon")
-			status.PrintHeader("DRY RUN COMPLETE")
-			status.PrintInfo(i18n.T("No actual changes were made."))
-			status.PrintFooter()
+			pui.PrintSuccess("DRY RUN COMPLETE")
+			pui.PrintInfo(i18n.T("No actual changes were made."))
 			return nil
 		}
 
@@ -136,7 +131,7 @@ var InstallCmd = &cobra.Command{
 			return fmt.Errorf("failed to install packages: %w", err)
 		}
 
-		fmt.Printf(i18n.T("Package installation completed successfully") + "\n")
+		pui.PrintSuccess(i18n.T("Package installation completed successfully"))
 		return nil
 	},
 }
@@ -147,6 +142,8 @@ func init() {
 	InstallCmd.Flags().Bool("auto-source", true, "Auto-build package names from Debian source")
 	InstallCmd.Flags().Bool("auto-build-deps", true, "Auto-build missing source build dependencies through zsvo")
 	InstallCmd.Flags().Bool("dry-run", false, "Show what would be done without making changes")
+	InstallCmd.Flags().IntP("jobs", "j", 1, "Number of parallel build jobs (default: 1 to prevent overheating)")
+	InstallCmd.Flags().Duration("cooldown", 5*time.Second, "Cooldown period between package builds (default: 5s)")
 }
 
 func isInstallFileTarget(target string) (bool, error) {
@@ -200,6 +197,10 @@ type autoBuildSession struct {
 	builtPackages    map[string]string
 	toolDepsReady    map[string]struct{}
 	buildingPackages map[string]struct{}
+	processing       map[string]struct{} // Track packages being processed to avoid duplicates
+	processingMu     sync.RWMutex        // Protect processing map
+	jobs             int                 // Number of parallel jobs
+	cooldown         time.Duration       // Cooldown between builds
 }
 
 // depNode represents a node in the dependency graph
@@ -353,7 +354,7 @@ func (g *depGraph) getMaxLevel() int {
 	return max
 }
 
-func newAutoBuildSession(workDir string, autoBuildDeps bool) *autoBuildSession {
+func newAutoBuildSession(workDir string, autoBuildDeps bool, jobs int, cooldown time.Duration) *autoBuildSession {
 	b := builder.NewBuilder(workDir)
 	b.SetQuiet(true)
 
@@ -368,6 +369,9 @@ func newAutoBuildSession(workDir string, autoBuildDeps bool) *autoBuildSession {
 		builtPackages:    make(map[string]string),
 		toolDepsReady:    make(map[string]struct{}),
 		buildingPackages: make(map[string]struct{}),
+		processing:       make(map[string]struct{}),
+		jobs:             jobs,
+		cooldown:         cooldown,
 	}
 	s.refreshBuildEnv()
 	return s
@@ -414,6 +418,7 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 		return "", fmt.Errorf("dependency cycle detected: %s", strings.Join(append(stack, requestName), " -> "))
 	}
 
+	// FAST CACHE CHECK: Check if already built this session
 	if builtPath, ok := s.builtPackages[requestName]; ok {
 		if asBuildDep {
 			if err := s.installBuildDependency(requestName, builtPath); err != nil {
@@ -421,6 +426,27 @@ func (s *autoBuildSession) buildPackageWithFallback(requestName string, asBuildD
 			}
 		}
 		return builtPath, nil
+	}
+
+	// FAST CACHE CHECK: Check local cache directory for existing package
+	cachePaths := []string{
+		filepath.Join(s.workDir, "packages", requestName, requestName+".pkg.tar.zst"),
+		filepath.Join(s.workDir, "packages", requestName+".pkg.tar.zst"),
+		filepath.Join(s.workDir, requestName+".pkg.tar.zst"),
+	}
+
+	for _, cachePath := range cachePaths {
+		if info, err := os.Stat(cachePath); err == nil && !info.IsDir() {
+			// Found in cache!
+			s.builtPackages[requestName] = cachePath
+			if asBuildDep {
+				if err := s.installBuildDependency(requestName, cachePath); err != nil {
+					return "", err
+				}
+			}
+			fmt.Printf("📦 %s found in cache: %s\n", requestName, cachePath)
+			return cachePath, nil
+		}
 	}
 
 	s.buildingPackages[requestName] = struct{}{}
@@ -608,7 +634,7 @@ func (s *autoBuildSession) installBuildDependency(dep, packagePath string) error
 }
 
 // collectAllDependencies recursively collects all dependencies into a graph without building
-// Now uses parallel workers (200 concurrent) for faster dependency resolution
+// Now uses parallel workers (5 concurrent) for faster dependency resolution
 func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGraph, stack []string) error {
 	rootPkg = normalizePackageName(rootPkg)
 	if rootPkg == "" {
@@ -626,13 +652,26 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 		}
 	}
 
-	// Skip if already processed
-	node := graph.getOrCreateNode(rootPkg)
-	if node.srcInfo != nil {
+	// Check if already being processed globally at session level
+	s.processingMu.Lock()
+	if _, exists := s.processing[rootPkg]; exists {
+		s.processingMu.Unlock()
+		return nil // Already being processed by another goroutine
+	}
+	// Mark as processing
+	s.processing[rootPkg] = struct{}{}
+	s.processingMu.Unlock()
+
+	// Check if already in graph with srcInfo
+	graph.mu.RLock()
+	node, exists := graph.nodes[rootPkg]
+	if exists && node.srcInfo != nil {
+		graph.mu.RUnlock()
 		return nil
 	}
+	graph.mu.RUnlock()
 
-	// Resolve source
+	// Resolve source - this is the expensive operation
 	srcInfo, err := s.resolver.ResolveSource(rootPkg)
 	if err != nil {
 		return fmt.Errorf("failed to resolve source for %s: %w", rootPkg, err)
@@ -642,10 +681,31 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 	rcp := autoRecipeFromDebian(srcInfo)
 	pkgName := rcp.Name
 
-	node = graph.getOrCreateNode(pkgName)
-	node.srcInfo = srcInfo
-	node.recipe = rcp
-	node.buildDepends = srcInfo.BuildDepends
+	// Update graph with proper locking
+	graph.mu.Lock()
+	node, exists = graph.nodes[pkgName]
+	if !exists {
+		node = &depNode{
+			name:         pkgName,
+			deps:         []string{},
+			dependents:   []string{},
+			buildDepends: []string{},
+			level:        -1,
+		}
+		graph.nodes[pkgName] = node
+	}
+	// Only update if not already set (first one wins)
+	if node.srcInfo == nil {
+		node.srcInfo = srcInfo
+		node.recipe = rcp
+		node.buildDepends = srcInfo.BuildDepends
+	}
+	graph.mu.Unlock()
+
+	// If this node was already processed by another goroutine, return early
+	if exists && node.srcInfo != nil {
+		return nil
+	}
 
 	// Collect all dependency names first
 	var depsToProcess []string
@@ -667,37 +727,20 @@ func (s *autoBuildSession) collectAllDependencies(rootPkg string, graph *depGrap
 		// Add dependency relationship
 		graph.addDependency(pkgName, sourcePkg)
 
-		// Check if already in graph
-		depNode := graph.getOrCreateNode(sourcePkg)
-		if depNode.srcInfo == nil {
+		// Check if already in graph with lock
+		graph.mu.RLock()
+		depNode, depExists := graph.nodes[sourcePkg]
+		alreadyProcessing := depExists && depNode.srcInfo != nil
+		graph.mu.RUnlock()
+
+		if !alreadyProcessing {
 			depsToProcess = append(depsToProcess, sourcePkg)
 		}
 	}
 
-	// Process dependencies in parallel using worker pool
-	if len(depsToProcess) > 0 {
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(depsToProcess))
-
-		// Semaphore to limit concurrent workers (10 workers)
-		semaphore := make(chan struct{}, parallelWorkers)
-
-		for _, dep := range depsToProcess {
-			wg.Add(1)
-			go func(depName string) {
-				defer wg.Done()
-
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-
-				if err := s.collectAllDependencies(depName, graph, append(stack, pkgName)); err != nil {
-					// Silent dependency collection
-				}
-			}(dep)
-		}
-
-		wg.Wait()
-		close(errChan)
+	// Process dependencies sequentially to avoid race conditions
+	for _, dep := range depsToProcess {
+		s.collectAllDependencies(dep, graph, append(stack, pkgName))
 	}
 
 	return nil
@@ -734,55 +777,81 @@ func (s *autoBuildSession) buildDependenciesParallel(graph *depGraph) error {
 			continue
 		}
 
-		fmt.Printf("\n🔨 Level %d: Building %d packages in parallel...\n", level, len(nodesToBuild))
+		fmt.Printf("\n🔨 Level %d: Building %d packages (jobs=%d)...\n", level, len(nodesToBuild), s.jobs)
 		for _, n := range nodesToBuild {
 			fmt.Printf("   - %s\n", n.name)
 		}
 
-		// Build this level in parallel
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(nodesToBuild))
-
-		// Limit concurrent builds
-		semaphore := make(chan struct{}, buildWorkers)
-
-		for _, node := range nodesToBuild {
-			wg.Add(1)
-			go func(n *depNode) {
-				defer wg.Done()
-
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-
-				// Build the package
-				_, err := s.buildPackageFromNode(n)
+		// Build this level - use single worker if jobs=1 for thermal safety
+		if s.jobs == 1 {
+			// Sequential build with cooldown
+			for _, node := range nodesToBuild {
+				_, err := s.buildPackageFromNode(node)
 				if err != nil {
-					n.err = err
-					errChan <- fmt.Errorf("%s: %w", n.name, err)
+					node.err = err
+					fmt.Printf("   ⚠️ %s failed: %v\n", node.name, err)
 				} else {
-					n.built = true
+					node.built = true
+					fmt.Printf("   ✓ %s complete\n", node.name)
 				}
-			}(node)
-		}
+				// Cooldown to prevent overheating
+				if s.cooldown > 0 {
+					fmt.Printf("   ⏱️  Cooling down for %v...\n", s.cooldown)
+					time.Sleep(s.cooldown)
+				}
+			}
+		} else {
+			// Parallel build with limited workers
+			var wg sync.WaitGroup
+			errChan := make(chan error, len(nodesToBuild))
 
-		wg.Wait()
-		close(errChan)
+			// Limit concurrent builds based on jobs setting
+			semaphore := make(chan struct{}, s.jobs)
 
-		// Check for errors
-		errors := make([]error, 0)
-		for err := range errChan {
-			errors = append(errors, err)
-		}
+			for _, node := range nodesToBuild {
+				wg.Add(1)
+				go func(n *depNode) {
+					defer wg.Done()
 
-		if len(errors) > 0 {
-			fmt.Printf("⚠️  %d packages failed at level %d\n", len(errors), level)
-			for _, err := range errors {
-				fmt.Printf("   %v\n", err)
+					semaphore <- struct{}{}
+					defer func() { <-semaphore }()
+
+					// Build the package
+					_, err := s.buildPackageFromNode(n)
+					if err != nil {
+						n.err = err
+						errChan <- fmt.Errorf("%s: %w", n.name, err)
+					} else {
+						n.built = true
+					}
+				}(node)
+			}
+
+			wg.Wait()
+			close(errChan)
+
+			// Check for errors
+			errors := make([]error, 0)
+			for err := range errChan {
+				errors = append(errors, err)
+			}
+
+			if len(errors) > 0 {
+				fmt.Printf("⚠️  %d packages failed at level %d\n", len(errors), level)
+				for _, err := range errors {
+					fmt.Printf("   %v\n", err)
+				}
 			}
 		}
 
 		// Refresh environment after each level
 		s.refreshBuildEnv()
+
+		// Level cooldown for thermal safety
+		if s.cooldown > 0 && level < maxLevel {
+			fmt.Printf("⏱️  Level cooldown for %v...\n", s.cooldown)
+			time.Sleep(s.cooldown)
+		}
 	}
 
 	return nil

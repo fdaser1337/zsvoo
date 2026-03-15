@@ -96,6 +96,28 @@ recipes/*.pkg.tar.*
 recipes/build/
 recipes/dist/
 
+# Docker artifacts
+.dockerignore
+Dockerfile
+docker-compose.yml
+test-in-docker.sh
+
+# Test artifacts
+test-results/
+*.log
+install-output.txt
+all-output.txt
+test-output.txt
+
+# Local test directories
+/tmp/zsvo-*
+/tmp/test-*
+/tmp/fakeroot-*
+/tmp/pkg-*
+/tmp/last-*
+/tmp/quick-*
+/tmp/final-*
+
 # Allow scripts directory
 !scripts/
 !scripts/*.sh

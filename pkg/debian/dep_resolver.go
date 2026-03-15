@@ -26,9 +26,11 @@ type DependencyResolver struct {
 
 // dependencyCache caches resolved dependencies
 type dependencyCache struct {
-	mu     sync.RWMutex
-	deps   map[string]*PackageDeps
-	srcMap map[string]string // binary pkg name -> source pkg name
+	mu       sync.RWMutex
+	deps     map[string]*PackageDeps
+	notFound map[string]bool            // cache of packages that were not found
+	srcMap   map[string]string          // binary pkg name -> source pkg name
+	inFlight map[string]*sync.WaitGroup // track in-flight requests
 }
 
 // PackageDeps represents Debian package dependencies
@@ -49,8 +51,10 @@ func NewDependencyResolver() *DependencyResolver {
 	return &DependencyResolver{
 		resolver: NewResolver(),
 		cache: &dependencyCache{
-			deps:   make(map[string]*PackageDeps),
-			srcMap: make(map[string]string),
+			deps:     make(map[string]*PackageDeps),
+			notFound: make(map[string]bool),
+			srcMap:   make(map[string]string),
+			inFlight: make(map[string]*sync.WaitGroup),
 		},
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -68,6 +72,11 @@ func NewDependencyResolver() *DependencyResolver {
 
 // ResolveDependencies resolves all dependencies for a Debian binary package
 func (r *DependencyResolver) ResolveDependencies(pkgName string) (*PackageDeps, error) {
+	// Check "not found" cache first to avoid repeated lookups
+	if r.cache.getNotFound(pkgName) {
+		return nil, fmt.Errorf("package %s not found (cached)", pkgName)
+	}
+
 	// Check cache first
 	if cached := r.cache.get(pkgName); cached != nil {
 		return cached, nil
@@ -76,6 +85,8 @@ func (r *DependencyResolver) ResolveDependencies(pkgName string) (*PackageDeps, 
 	// Try to find in Sources files (for build-deps) or Packages files (for runtime deps)
 	deps, err := r.resolveFromDebian(pkgName)
 	if err != nil {
+		// Cache the failure to avoid repeated lookups
+		r.cache.setNotFound(pkgName)
 		return nil, err
 	}
 
@@ -87,7 +98,12 @@ func (r *DependencyResolver) ResolveDependencies(pkgName string) (*PackageDeps, 
 
 // BinaryToSource maps a Debian binary package name to its source package name
 func (r *DependencyResolver) BinaryToSource(binaryPkg string) (string, error) {
-	// Check cache
+	// Check "not found" cache first
+	if r.cache.getNotFound(binaryPkg) {
+		return "", fmt.Errorf("package %s not found (cached)", binaryPkg)
+	}
+
+	// Check srcMap cache
 	if src := r.cache.getSource(binaryPkg); src != "" {
 		return src, nil
 	}
@@ -98,13 +114,37 @@ func (r *DependencyResolver) BinaryToSource(binaryPkg string) (string, error) {
 		return src, nil
 	}
 
+	// Check if request is already in flight
+	wg, inFlight := r.cache.startInFlight(binaryPkg)
+	if inFlight {
+		// Wait for the in-flight request to complete
+		wg.Wait()
+		// Check cache again after waiting
+		if r.cache.getNotFound(binaryPkg) {
+			return "", fmt.Errorf("package %s not found (cached after wait)", binaryPkg)
+		}
+		if src := r.cache.getSource(binaryPkg); src != "" {
+			return src, nil
+		}
+		return "", fmt.Errorf("package %s not found after wait", binaryPkg)
+	}
+
+	// We are the first request for this package
+	defer func() {
+		// finishInFlight will be called after we complete the lookup
+	}()
+
 	// Look up in Debian Sources
 	srcInfo, err := r.resolver.ResolveSource(binaryPkg)
 	if err != nil {
+		// Cache the failure and mark in-flight as complete
+		r.cache.finishInFlight(binaryPkg, true)
 		return "", fmt.Errorf("cannot resolve source for %s: %w", binaryPkg, err)
 	}
 
+	// Cache success and mark in-flight as complete
 	r.cache.setSource(binaryPkg, srcInfo.SourcePackage)
+	r.cache.finishInFlight(binaryPkg, false)
 	return srcInfo.SourcePackage, nil
 }
 
@@ -297,6 +337,54 @@ func (c *dependencyCache) get(pkg string) *PackageDeps {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.deps[pkg]
+}
+
+func (c *dependencyCache) getNotFound(pkg string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.notFound[pkg]
+}
+
+func (c *dependencyCache) setNotFound(pkg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.notFound[pkg] = true
+}
+
+// startInFlight starts tracking an in-flight request, returns wait group if already in flight
+func (c *dependencyCache) startInFlight(pkg string) (*sync.WaitGroup, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check if already cached as not found
+	if c.notFound[pkg] {
+		return nil, false
+	}
+
+	// Check if already in flight
+	if wg, exists := c.inFlight[pkg]; exists {
+		return wg, true
+	}
+
+	// Create new wait group for this request
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	c.inFlight[pkg] = wg
+	return wg, false
+}
+
+// finishInFlight marks in-flight request as complete
+func (c *dependencyCache) finishInFlight(pkg string, notFound bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if wg, exists := c.inFlight[pkg]; exists {
+		delete(c.inFlight, pkg)
+		if notFound {
+			c.notFound[pkg] = true
+		}
+		wg.Done()
+	}
 }
 
 func (c *dependencyCache) set(pkg string, deps *PackageDeps) {

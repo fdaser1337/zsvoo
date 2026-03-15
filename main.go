@@ -4,15 +4,16 @@ import (
 	"log"
 	"os"
 
-	"github.com/spf13/cobra"
 	"zsvo/cmd"
 	"zsvo/pkg/i18n"
+
+	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
 	Use:           "zsvo",
 	Short:         "A simple source-based package manager",
-	SilenceErrors: true,
+	SilenceErrors: false,
 	SilenceUsage:  true,
 	Long: `A minimal package manager for custom Linux distributions based on LFS
 
@@ -48,10 +49,10 @@ func init() {
 func main() {
 	// Detect language from environment
 	i18n.DetectLanguage()
-	
+
 	// Set up logging
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	
+
 	if err := rootCmd.Execute(); err != nil {
 		log.Printf("Error: %v", err)
 		os.Exit(1)
